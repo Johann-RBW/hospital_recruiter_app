@@ -1,0 +1,16 @@
+# .streamlit/config.toml
+
+[theme]
+# This completely disables Streamlit's auto-dark mode
+base="light"
+
+# We map Streamlit's native variables to our CandidateIQ brand colors
+backgroundColor="#E8E4DC"
+secondaryBackgroundColor="#EAE6DE"
+textColor="#1A1916"
+primaryColor="#D4380D"
+font="sans serif"
+
+[client]
+# Hides the Streamlit toolbar in the top right
+toolbarMode = "minimal"

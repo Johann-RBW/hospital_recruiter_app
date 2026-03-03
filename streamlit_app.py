@@ -50,18 +50,25 @@ st.markdown("""
   --brutalist-shadow: 4px 4px 0px var(--border);
 }
 
-/* ── Global Reset ───────────────────────────────────── */
+/* ── Global Reset & Aggressive Background Override ─── */
 html, body, [class*="css"] {
   font-family: 'DM Sans', sans-serif;
   background-color: var(--bg) !important;
   color: var(--ink);
 }
 
-/* ── Hide Streamlit chrome ──────────────────────────── */
-#MainMenu, footer, header { visibility: hidden; }
-.block-container {
-  max-width: 1100px;
-  padding: 2.5rem 2rem 4rem !important;
+/* Force Streamlit's deep container layers to accept our background */
+.stApp, 
+[data-testid="stAppViewContainer"], 
+[data-testid="stAppViewBlockContainer"], 
+[data-testid="stHeader"] {
+    background-color: var(--bg) !important;
+    background: var(--bg) !important;
+}
+
+/* Hide Streamlit top header completely */
+[data-testid="stHeader"] {
+    display: none !important;
 }
 
 /* ── Masthead ────────────────────────────────────────── */
