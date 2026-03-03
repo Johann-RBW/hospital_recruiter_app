@@ -64,18 +64,20 @@ if st.button("Search", type="primary"):
                 st.error(f"An error occurred during Groq extraction: {e}")
                 st.stop()
 
-        # --- APOLLO API INTEGRATION ---
+       # --- APOLLO API INTEGRATION ---
         with st.spinner("Searching Apollo.io for matching candidates..."):
             try:
-                url = "https://api.apollo.io/api/v1/mixed_people/search"
+                # 1. Updated URL: Using Apollo's new endpoint for current API tokens
+                url = "https://api.apollo.io/v1/mixed_people/api_search"
                 headers = {
                     "Cache-Control": "no-cache",
-                    "Content-Type": "application/json",
-                    "x-api-key": apollo_api_key
+                    "Content-Type": "application/json"
                 }
                 
                 # Build the search payload from the Groq data
                 payload = {
+                    # 2. Authentication: Passing the key directly in the payload bypasses header 403s
+                    "api_key": apollo_api_key, 
                     "per_page": 10
                 }
                 
@@ -91,7 +93,8 @@ if st.button("Search", type="primary"):
                 apollo_response.raise_for_status() 
                 apollo_data = apollo_response.json()
                 
-                people = apollo_data.get("people", [])
+                # Safely grab the data (the new endpoint sometimes uses 'contacts' instead of 'people')
+                people = apollo_data.get("people", apollo_data.get("contacts", []))
                 
                 if not people:
                     st.warning("No candidates found matching those specific requirements in Apollo.")
@@ -102,8 +105,6 @@ if st.button("Search", type="primary"):
                     # Parse Apollo response into our table structure
                     formatted_results = []
                     for person in people:
-                        
-                        # Handle potential missing data safely
                         first_name = person.get("first_name", "")
                         last_name = person.get("last_name", "")
                         org = person.get("organization") or {}
@@ -119,7 +120,7 @@ if st.button("Search", type="primary"):
                             "Current Job Title": person.get("title", "N/A"),
                             "Company": org.get("name", "N/A"),
                             "Location": location_str,
-                            "Email": person.get("email", "Not Provided")
+                            "Email": person.get("email", "Not Provided") # api_search may mask emails on the free tier
                         })
                     
                     # Display real data and setup CSV export
