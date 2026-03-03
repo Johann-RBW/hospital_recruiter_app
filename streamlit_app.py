@@ -15,6 +15,16 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────────
+# STATE MANAGEMENT (Fixes the Download Button Rerun Bug)
+# ─────────────────────────────────────────────────────────────
+if "search_active" not in st.session_state:
+    st.session_state.search_active = False
+    st.session_state.extracted_data = {}
+    st.session_state.filtered_df = pd.DataFrame()
+    st.session_state.fallback_used = False
+    st.session_state.city = None
+
+# ─────────────────────────────────────────────────────────────
 # CUSTOM CSS  —  Neobrutalism × Neumorphism hybrid
 # ─────────────────────────────────────────────────────────────
 st.markdown("""
@@ -400,16 +410,16 @@ with col_tip:
 st.markdown("<hr>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
-# SEARCH LOGIC
+# SEARCH LOGIC (Executing and saving to state)
 # ─────────────────────────────────────────────────────────────
 if search_clicked:
     if not job_description.strip():
         st.warning("Please paste a job description before running a search.")
+        st.session_state.search_active = False
     else:
-
+        st.session_state.search_active = True
+        
         # ── STEP 1: Groq Extraction ──────────────────────────
-        st.markdown('<span class="section-label">02 — Extracted Requirements</span>', unsafe_allow_html=True)
-
         with st.spinner("Parsing job description with LLaMA 3.1…"):
             prompt = f"""
 You are an expert healthcare recruiter. Analyze the following job description and extract the key details.
@@ -438,59 +448,13 @@ Job Description:
                     response_format={"type": "json_object"},
                     temperature=0,
                 )
-                extracted_data = json.loads(response.choices[0].message.content)
+                st.session_state.extracted_data = json.loads(response.choices[0].message.content)
 
             except Exception as e:
                 st.error(f"Groq extraction failed: {e}")
                 st.stop()
 
-        # ── Render extracted data as styled cards ─────────────
-        c1, c2, c3, c4 = st.columns(4)
-        cards = [
-            (c1, "Role",       extracted_data.get("job_title", "—"),           "accent"),
-            (c2, "Location",   extracted_data.get("location", "—"),             "default"),
-            (c3, "Experience", str(extracted_data.get("years_of_experience","—")), "default"),
-            (c4, "Shift",      extracted_data.get("shift_type") or "Unspecified", "default"),
-        ]
-        for col, lbl, val, kind in cards:
-            with col:
-                border_color = "var(--accent)" if kind == "accent" else "var(--border)"
-                col.markdown(f"""
-<div class="neu-card" style="border-left: 4px solid {border_color}; padding: 0.9rem 1.1rem;">
-  <div style="font-family:'DM Mono',monospace;font-size:0.6rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--ink-muted);">{lbl}</div>
-  <div style="font-family:'Syne',sans-serif;font-weight:700;font-size:1rem;margin-top:4px;line-height:1.2;">{val}</div>
-</div>""", unsafe_allow_html=True)
-
-        # Skills + Certs in two columns
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            skills = extracted_data.get("required_skills", [])
-            tags = "".join([f'<span class="tag">{s}</span>' for s in skills]) if skills else '<span class="tag">None extracted</span>'
-            st.markdown(f"""
-<div class="neu-card">
-  <div style="font-family:'DM Mono',monospace;font-size:0.62rem;letter-spacing:0.14em;text-transform:uppercase;color:var(--ink-muted);margin-bottom:0.6rem;">Required Skills</div>
-  <div class="tag-row">{tags}</div>
-</div>""", unsafe_allow_html=True)
-
-        with sc2:
-            certs = extracted_data.get("required_certifications", [])
-            tags2 = "".join([f'<span class="tag tag-accent2">{c}</span>' for c in certs]) if certs else '<span class="tag">None extracted</span>'
-            edu = extracted_data.get("education_level") or "Not specified"
-            st.markdown(f"""
-<div class="neu-card">
-  <div style="font-family:'DM Mono',monospace;font-size:0.62rem;letter-spacing:0.14em;text-transform:uppercase;color:var(--ink-muted);margin-bottom:0.6rem;">Certifications &amp; Education</div>
-  <div class="tag-row">{tags2}</div>
-  <div style="margin-top:0.6rem;font-size:0.8rem;color:var(--ink-muted);">Education: <strong style="color:var(--ink);">{edu}</strong></div>
-</div>""", unsafe_allow_html=True)
-
-        with st.expander("View raw JSON payload"):
-            st.json(extracted_data)
-
-        st.markdown("<hr>", unsafe_allow_html=True)
-
         # ── STEP 2: Database Match ───────────────────────────
-        st.markdown('<span class="section-label">03 — Matched Candidates</span>', unsafe_allow_html=True)
-
         with st.spinner("Searching candidate database…"):
             try:
                 file_path = "candidates.csv"
@@ -502,7 +466,7 @@ Job Description:
                 filtered_df = df.copy()
 
                 # Title match
-                extracted_title = extracted_data.get("job_title")
+                extracted_title = st.session_state.extracted_data.get("job_title")
                 if extracted_title and str(extracted_title).lower() != "null":
                     core_title = " ".join(
                         str(extracted_title).replace("(", "").replace(")", "").split()[:2]
@@ -512,68 +476,138 @@ Job Description:
                     ]
 
                 # Location match with fallback
-                extracted_location = extracted_data.get("location")
+                extracted_location = st.session_state.extracted_data.get("location")
                 location_matched_df = filtered_df.copy()
-                fallback_used = False
+                
+                # Reset these variables safely for the current run
+                st.session_state.fallback_used = False
+                st.session_state.city = None
 
                 if extracted_location and str(extracted_location).lower() != "null":
-                    city = extracted_location.split(",")[0].strip()
+                    st.session_state.city = extracted_location.split(",")[0].strip()
                     location_matched_df = filtered_df[
-                        filtered_df["Location"].str.contains(city, case=False, na=False, regex=False)
+                        filtered_df["Location"].str.contains(st.session_state.city, case=False, na=False, regex=False)
                     ]
 
                 if location_matched_df.empty and not filtered_df.empty:
-                    fallback_used = True
+                    st.session_state.fallback_used = True
                 else:
                     filtered_df = location_matched_df
+                    
+                st.session_state.filtered_df = filtered_df
 
             except Exception as e:
                 st.error(f"Database search error: {e}")
                 st.stop()
 
-        # ── Render results ────────────────────────────────────
-        if filtered_df.empty:
-            st.warning("No candidates matched the extracted requirements in the current database.")
-        else:
-            n = len(filtered_df)
 
-            if fallback_used:
-                st.info(f"No exact city match for **{city}**. Showing {n} regional candidates with matching titles.")
+# ─────────────────────────────────────────────────────────────
+# RENDER RESULTS (Reads from State)
+# ─────────────────────────────────────────────────────────────
+if st.session_state.search_active:
+    extracted_data = st.session_state.extracted_data
+    filtered_df = st.session_state.filtered_df
+    fallback_used = st.session_state.fallback_used
+    city = st.session_state.city
+    
+    st.markdown('<span class="section-label">02 — Extracted Requirements</span>', unsafe_allow_html=True)
 
-            # Stat strip
-            dept = extracted_data.get("department") or "Healthcare"
-            ms1, ms2, ms3 = st.columns(3)
-            for col, num, lbl in [
-                (ms1, n,              "Candidates Found"),
-                (ms2, len(df),        "Total in Database"),
-                (ms3, round(n/max(len(df),1)*100,1), "Match Rate %"),
-            ]:
-                with col:
-                    col.markdown(f"""
+    # ── Render extracted data as styled cards ─────────────
+    c1, c2, c3, c4 = st.columns(4)
+    cards = [
+        (c1, "Role",       extracted_data.get("job_title", "—"),           "accent"),
+        (c2, "Location",   extracted_data.get("location", "—"),             "default"),
+        (c3, "Experience", str(extracted_data.get("years_of_experience","—")), "default"),
+        (c4, "Shift",      extracted_data.get("shift_type") or "Unspecified", "default"),
+    ]
+    for col, lbl, val, kind in cards:
+        with col:
+            border_color = "var(--accent)" if kind == "accent" else "var(--border)"
+            col.markdown(f"""
+<div class="neu-card" style="border-left: 4px solid {border_color}; padding: 0.9rem 1.1rem;">
+<div style="font-family:'DM Mono',monospace;font-size:0.6rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--ink-muted);">{lbl}</div>
+<div style="font-family:'Syne',sans-serif;font-weight:700;font-size:1rem;margin-top:4px;line-height:1.2;">{val}</div>
+</div>""", unsafe_allow_html=True)
+
+    # Skills + Certs in two columns
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        skills = extracted_data.get("required_skills", [])
+        tags = "".join([f'<span class="tag">{s}</span>' for s in skills]) if skills else '<span class="tag">None extracted</span>'
+        st.markdown(f"""
+<div class="neu-card">
+<div style="font-family:'DM Mono',monospace;font-size:0.62rem;letter-spacing:0.14em;text-transform:uppercase;color:var(--ink-muted);margin-bottom:0.6rem;">Required Skills</div>
+<div class="tag-row">{tags}</div>
+</div>""", unsafe_allow_html=True)
+
+    with sc2:
+        certs = extracted_data.get("required_certifications", [])
+        tags2 = "".join([f'<span class="tag tag-accent2">{c}</span>' for c in certs]) if certs else '<span class="tag">None extracted</span>'
+        edu = extracted_data.get("education_level") or "Not specified"
+        st.markdown(f"""
+<div class="neu-card">
+<div style="font-family:'DM Mono',monospace;font-size:0.62rem;letter-spacing:0.14em;text-transform:uppercase;color:var(--ink-muted);margin-bottom:0.6rem;">Certifications &amp; Education</div>
+<div class="tag-row">{tags2}</div>
+<div style="margin-top:0.6rem;font-size:0.8rem;color:var(--ink-muted);">Education: <strong style="color:var(--ink);">{edu}</strong></div>
+</div>""", unsafe_allow_html=True)
+
+    with st.expander("View raw JSON payload"):
+        st.json(extracted_data)
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+    # ── MATCH RENDER ───────────────────────────
+    st.markdown('<span class="section-label">03 — Matched Candidates</span>', unsafe_allow_html=True)
+    
+    if filtered_df.empty:
+        st.warning("No candidates matched the extracted requirements in the current database.")
+    else:
+        n = len(filtered_df)
+
+        if fallback_used and city:
+            st.info(f"No exact city match for **{city}**. Showing {n} regional candidates with matching titles.")
+
+        # Stat strip
+        dept = extracted_data.get("department") or "Healthcare"
+        
+        # Read full df length just for the stat block
+        try:
+            total_db_count = len(pd.read_csv("candidates.csv"))
+        except:
+            total_db_count = max(n, 1)
+            
+        ms1, ms2, ms3 = st.columns(3)
+        for col, num, lbl in [
+            (ms1, n,              "Candidates Found"),
+            (ms2, total_db_count, "Total in Database"),
+            (ms3, round(n/max(total_db_count,1)*100,1), "Match Rate %"),
+        ]:
+            with col:
+                col.markdown(f"""
 <div class="stat-card">
-  <div class="stat-num">{num}</div>
-  <div class="stat-lbl">{lbl}</div>
+<div class="stat-num">{num}</div>
+<div class="stat-lbl">{lbl}</div>
 </div>""", unsafe_allow_html=True)
 
-            st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
 
-            # Result table with branded header
-            st.markdown(f"""
+        # Result table with branded header
+        st.markdown(f"""
 <div class="result-header">
-  <span class="result-header-title">Candidate Results — {dept}</span>
-  <span class="result-header-count">{n} record{'s' if n!=1 else ''}</span>
+<span class="result-header-title">Candidate Results — {dept}</span>
+<span class="result-header-count">{n} record{'s' if n!=1 else ''}</span>
 </div>""", unsafe_allow_html=True)
 
-            display_cols = ["Name", "Job Title", "Company", "Location", "Email", "Phone"]
-            display_df = filtered_df[display_cols].rename(columns={"Job Title": "Current Title"})
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+        display_cols = ["Name", "Job Title", "Company", "Location", "Email", "Phone"]
+        display_df = filtered_df[display_cols].rename(columns={"Job Title": "Current Title"})
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-            # Export
-            st.markdown("<br>", unsafe_allow_html=True)
-            csv = display_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label="↓  Export CSV",
-                data=csv,
-                file_name="matched_candidates.csv",
-                mime="text/csv",
-            )
+        # Export
+        st.markdown("<br>", unsafe_allow_html=True)
+        csv = display_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="↓  Export CSV",
+            data=csv,
+            file_name="matched_candidates.csv",
+            mime="text/csv",
+        )
