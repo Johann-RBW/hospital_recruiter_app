@@ -431,16 +431,20 @@ if search_clicked:
             prompt = f"""
 You are an expert healthcare recruiter. Analyze the following job description and extract the key details.
 
-CRITICAL INSTRUCTION: Do not just look for explicit keywords. Deduce and extrapolate required skills,
-certifications, and experience levels from the context of daily responsibilities, patient care duties,
-and tools mentioned in the text.
+CRITICAL INSTRUCTION - THE "BRAIN" PROTOCOL:
+1. Do not just blindly copy-paste literal phrases from the text. 
+2. NORMALIZE AND STANDARDIZE all skills, certifications, and education into their most common healthcare industry acronyms and standard terms. 
+   - Example: Convert "Registered Professional Nursing Program" to "RN" and "BSN".
+   - Example: Convert "Basic Life Support" to "BLS".
+3. EXPAND the search net: For every core requirement, include both the acronym and the spelled-out version in the lists (e.g., ["RN", "Registered Nurse", "BLS", "Basic Life Support"]).
+4. Deduce implied clinical skills from the daily duties described.
 
 Return ONLY a valid JSON object with these exact keys:
-- "job_title" (string)
+- "job_title" (string - simplify to the core standard title, e.g., "Registered Nurse" instead of "RN III - Emergency Level 1")
 - "department" (string or null)
-- "required_skills" (list of strings)
-- "required_certifications" (list of strings)
-- "education_level" (string or null)
+- "required_skills" (list of strings - standardized terms and synonyms)
+- "required_certifications" (list of strings - standard acronyms and full names)
+- "education_level" (string or null - e.g., "BSN", "ASN", "MSN", "High School")
 - "location" (string)
 - "years_of_experience" (string or number)
 - "shift_type" (string or null)
