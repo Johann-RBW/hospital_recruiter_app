@@ -461,8 +461,8 @@ Job Description:
                 st.error(f"Groq extraction failed: {e}")
                 st.stop()
 
-        # ── STEP 2: Database Match ───────────────────────────
-        with st.spinner("Searching candidate database…"):
+        # ── STEP 2: Database Match & AI Scoring ───────────────────
+        with st.spinner("Scoring and ranking candidates…"):
             try:
                 file_path = "candidates.csv"
                 if not os.path.exists(file_path):
@@ -472,7 +472,7 @@ Job Description:
                 df = pd.read_csv(file_path)
                 filtered_df = df.copy()
 
-                # Title match
+                # 1. Title match (Base Filter)
                 extracted_title = st.session_state.extracted_data.get("job_title")
                 if extracted_title and str(extracted_title).lower() != "null":
                     core_title = " ".join(
@@ -482,11 +482,10 @@ Job Description:
                         filtered_df["Job Title"].str.contains(core_title, case=False, na=False, regex=False)
                     ]
 
-                # Location match with fallback
+                # 2. Location match with fallback (Base Filter)
                 extracted_location = st.session_state.extracted_data.get("location")
                 location_matched_df = filtered_df.copy()
                 
-                # Reset these variables safely for the current run
                 st.session_state.fallback_used = False
                 st.session_state.city = None
 
@@ -500,6 +499,37 @@ Job Description:
                     st.session_state.fallback_used = True
                 else:
                     filtered_df = location_matched_df
+
+                # 3. AI Resume Scoring Engine
+                # Pool all extracted requirements
+                req_skills = st.session_state.extracted_data.get("required_skills", []) or []
+                req_certs = st.session_state.extracted_data.get("required_certifications", []) or []
+                target_keywords = [str(k).lower().strip() for k in (req_skills + req_certs) if k]
+
+                def calculate_score(row):
+                    if not target_keywords:
+                        return 100 # If Groq found 0 requirements, assume 100% match based on title alone
+                    
+                    # Mash candidate data together into a "resume block"
+                    cand_text = " ".join([
+                        str(row.get('Skills', '')),
+                        str(row.get('Certifications', '')),
+                        str(row.get('Background_Summary', ''))
+                    ]).lower()
+                    
+                    # Count matches
+                    matches = sum(1 for kw in target_keywords if kw in cand_text)
+                    return int((matches / len(target_keywords)) * 100)
+
+                # Apply the score
+                filtered_df['Match Score'] = filtered_df.apply(calculate_score, axis=1)
+                
+                # THE KILL SWITCH: Drop anyone with a 0% skill match
+                if target_keywords:
+                    filtered_df = filtered_df[filtered_df['Match Score'] > 0]
+
+                # Sort best candidates to the top
+                filtered_df = filtered_df.sort_values(by='Match Score', ascending=False)
                     
                 st.session_state.filtered_df = filtered_df
 
@@ -567,27 +597,23 @@ if st.session_state.search_active:
     st.markdown('<span class="section-label">03 — Matched Candidates</span>', unsafe_allow_html=True)
     
     if filtered_df.empty:
-        st.warning("No candidates matched the extracted requirements in the current database.")
+        st.warning("No candidates matched the extracted requirements in the current database. Try broadening the job description.")
     else:
         n = len(filtered_df)
 
         if fallback_used and city:
             st.info(f"No exact city match for **{city}**. Showing {n} regional candidates with matching titles.")
 
-        # Stat strip
+        # Stat strip update
         dept = extracted_data.get("department") or "Healthcare"
-        
-        # Read full df length just for the stat block
-        try:
-            total_db_count = len(pd.read_csv("candidates.csv"))
-        except:
-            total_db_count = max(n, 1)
+        top_score = f"{filtered_df['Match Score'].max()}%" if not filtered_df.empty else "N/A"
+        avg_score = f"{int(filtered_df['Match Score'].mean())}%" if not filtered_df.empty else "N/A"
             
         ms1, ms2, ms3 = st.columns(3)
         for col, num, lbl in [
-            (ms1, n,              "Candidates Found"),
-            (ms2, total_db_count, "Total in Database"),
-            (ms3, round(n/max(total_db_count,1)*100,1), "Match Rate %"),
+            (ms1, n,              "Qualified Candidates"),
+            (ms2, top_score,      "Top Match Score"),
+            (ms3, avg_score,      "Avg Match Score"),
         ]:
             with col:
                 col.markdown(f"""
@@ -605,13 +631,19 @@ if st.session_state.search_active:
 <span class="result-header-count">{n} record{'s' if n!=1 else ''}</span>
 </div>""", unsafe_allow_html=True)
 
-        display_cols = ["Name", "Job Title", "Company", "Location", "Email", "Phone"]
-        display_df = filtered_df[display_cols].rename(columns={"Job Title": "Current Title"})
+        # Format display dataframe
+        display_cols = ["Name", "Job Title", "Match Score", "Company", "Location", "Email", "Phone"]
+        display_df = filtered_df[display_cols].copy()
+        display_df = display_df.rename(columns={"Job Title": "Current Title"})
+        
+        # Add the % sign to the UI column
+        display_df['Match Score'] = display_df['Match Score'].astype(str) + "%"
+        
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-        # Export
+        # Export (Keep numeric scores for the CSV)
         st.markdown("<br>", unsafe_allow_html=True)
-        csv = display_df.to_csv(index=False).encode("utf-8")
+        csv = filtered_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="↓  Export CSV",
             data=csv,
