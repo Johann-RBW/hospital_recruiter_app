@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import json
-import requests
+import os
 from groq import Groq
 
 # 1. Page Configuration & Header
@@ -10,18 +10,17 @@ st.set_page_config(page_title="Candidate Finder", page_icon="🏥", layout="wide
 st.title("🏥 Healthcare Candidate Finder")
 st.write("Paste a job description below to automatically extract key requirements and find matching candidates.")
 
-# 2. Initialize API Keys via Streamlit Secrets
+# 2. Initialize Groq Client via Streamlit Secrets
 try:
     groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-    apollo_api_key = st.secrets["APOLLO_API_KEY"]
-except KeyError as e:
-    st.error(f"Missing Secret: {e}. Please add it to your .streamlit/secrets.toml file.")
+except KeyError:
+    st.error("GROQ_API_KEY is missing. Please add it to your .streamlit/secrets.toml file.")
     st.stop()
 
 # 3. Input Area
 job_description = st.text_area("Paste Job Description", height=200, placeholder="Enter the full job description here...")
 
-# 4. Action Button & API Call
+# 4. Action Button & Core Logic
 if st.button("Search", type="primary"):
     if not job_description.strip():
         st.warning("Please paste a job description before searching.")
@@ -64,76 +63,64 @@ if st.button("Search", type="primary"):
                 st.error(f"An error occurred during Groq extraction: {e}")
                 st.stop()
 
-       # --- APOLLO API INTEGRATION ---
-        with st.spinner("Searching Apollo.io for matching candidates..."):
+        # --- LOCAL MOCK DATABASE SEARCH ---
+        with st.spinner("Searching local candidate database..."):
             try:
-                # 1. Updated URL: Using Apollo's new endpoint for current API tokens
-                url = "https://api.apollo.io/v1/mixed_people/api_search"
-                headers = {
-                    "Cache-Control": "no-cache",
-                    "Content-Type": "application/json"
-                }
+                # 1. Load the CSV
+                file_path = "candidates.csv"
+                if not os.path.exists(file_path):
+                    st.error(f"Could not find '{file_path}'. Make sure it is saved in the root directory.")
+                    st.stop()
+                    
+                df = pd.read_csv(file_path)
+                filtered_df = df.copy()
                 
-                # Build the search payload from the Groq data
-                payload = {
-                    # 2. Authentication: Passing the key directly in the payload bypasses header 403s
-                    "api_key": apollo_api_key, 
-                    "per_page": 10
-                }
+                # 2. Resilient Title Matching
+                extracted_title = extracted_data.get("job_title")
+                if extracted_title and str(extracted_title).lower() != "null":
+                    # Grab just the first two words to catch "Patient Care" out of "Patient Care Associate (PCA)"
+                    core_title = " ".join(str(extracted_title).replace("(", "").replace(")", "").split()[:2])
+                    
+                    # regex=False fixes the warning, core_title makes it a fuzzy match
+                    filtered_df = filtered_df[filtered_df['Job Title'].str.contains(core_title, case=False, na=False, regex=False)]
                 
-                # We map the extracted values to Apollo's expected query arrays
-                if extracted_data.get("location"):
-                    payload["person_locations"] = [extracted_data["location"]]
+                # 3. Resilient Location Matching (with fallback)
+                extracted_location = extracted_data.get("location")
+                location_matched_df = filtered_df.copy()
                 
-                if extracted_data.get("job_title"):
-                    payload["person_titles"] = [extracted_data["job_title"]]
+                if extracted_location and str(extracted_location).lower() != "null":
+                    city = extracted_location.split(',')[0].strip()
+                    location_matched_df = filtered_df[filtered_df['Location'].str.contains(city, case=False, na=False, regex=False)]
                 
-                # Send request to Apollo
-                apollo_response = requests.post(url, headers=headers, json=payload)
-                apollo_response.raise_for_status() 
-                apollo_data = apollo_response.json()
-                
-                # Safely grab the data (the new endpoint sometimes uses 'contacts' instead of 'people')
-                people = apollo_data.get("people", apollo_data.get("contacts", []))
-                
-                if not people:
-                    st.warning("No candidates found matching those specific requirements in Apollo.")
+                # Fallback: If no one is in that exact city, show the wider region matches instead of an empty table
+                if location_matched_df.empty and not filtered_df.empty:
+                    st.info(f"No exact matches found in {city}. Showing {len(filtered_df)} regional candidates with matching titles.")
                 else:
-                    st.success("Candidates found!")
-                    st.subheader(f"Real Candidate Results ({len(people)})")
+                    filtered_df = location_matched_df
+                
+                # 4. Display Results
+                if filtered_df.empty:
+                    st.warning("No candidates found matching those specific requirements in the database.")
+                else:
+                    # We already showed the st.info fallback message above if location didn't match
+                    st.subheader(f"Candidate Results ({len(filtered_df)})")
                     
-                    # Parse Apollo response into our table structure
-                    formatted_results = []
-                    for person in people:
-                        first_name = person.get("first_name", "")
-                        last_name = person.get("last_name", "")
-                        org = person.get("organization") or {}
-                        city = person.get("city") or ""
-                        state = person.get("state") or ""
-                        
-                        location_str = f"{city}, {state}".strip(", ")
-                        if not location_str:
-                            location_str = "N/A"
-                            
-                        formatted_results.append({
-                            "Name": f"{first_name} {last_name}".strip() or "N/A",
-                            "Current Job Title": person.get("title", "N/A"),
-                            "Company": org.get("name", "N/A"),
-                            "Location": location_str,
-                            "Email": person.get("email", "Not Provided") # api_search may mask emails on the free tier
-                        })
+                    # 1. Select the columns using the ORIGINAL names first
+                    display_cols = ["Name", "Job Title", "Company", "Location", "Email", "Phone"]
+                    display_df = filtered_df[display_cols]
                     
-                    # Display real data and setup CSV export
-                    df = pd.DataFrame(formatted_results)
-                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    # 2. Rename the column AFTER selecting it
+                    display_df = display_df.rename(columns={"Job Title": "Current Job Title"})
                     
-                    csv = df.to_csv(index=False).encode('utf-8')
+                    st.dataframe(display_df, use_container_width=True, hide_index=True)
+                    
+                    csv = display_df.to_csv(index=False).encode('utf-8')
                     st.download_button(
                         label="Download Results as CSV",
                         data=csv,
-                        file_name='apollo_candidates.csv',
+                        file_name='matched_candidates.csv',
                         mime='text/csv'
                     )
 
-            except requests.exceptions.RequestException as e:
-                st.error(f"An error occurred communicating with Apollo API: {e}")
+            except Exception as e:
+                st.error(f"An error occurred while searching the database: {e}")
