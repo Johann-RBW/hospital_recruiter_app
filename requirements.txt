@@ -1,5 +1,5 @@
 streamlit==1.32.0
 pandas==2.2.1
 python-dotenv==1.0.1
-groq==0.4.2
+groq
 requests==2.31.0
