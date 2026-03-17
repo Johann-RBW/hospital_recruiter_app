@@ -1,8 +1,6 @@
 # ─────────────────────────────────────────────────────────────
-# pdl_search.py
-# prod-api-testing branch
-# Uses PDL's SQL endpoint — compatible with free tier.
-# Place in the same directory as streamlit_app.py
+# pdl_search.py  —  prod-api-testing branch
+# PDL free-tier compatible. SQL only, no Elasticsearch syntax.
 # ─────────────────────────────────────────────────────────────
 
 import requests
@@ -18,138 +16,128 @@ PDL_SQL_ENDPOINT = "https://api.peopledatalabs.com/v5/person/search"
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. SQL QUERY BUILDER  (free-tier compatible)
+# 1. SQL QUERY BUILDER
+# Key design decision: NO skills in the SQL filter.
+#
+# Why: PDL free tier uses normalized skill tags ("physical therapy",
+# "home health") — Groq extracts narrative phrases ("NYS Licensure",
+# "Multidisciplinary Approach") that never match PDL's taxonomy.
+# Putting skills in SQL guarantees zero results.
+#
+# Instead: SQL = broad title + location funnel only.
+# The Python sift + LLM judge downstream handle all skill precision.
 # ─────────────────────────────────────────────────────────────
 
-def build_pdl_sql(extracted: dict) -> str:
-    """
-    Builds a PDL SQL string from Groq-extracted fields.
-    PDL's SQL dialect supports: SELECT, WHERE, AND, OR, LIKE, LIMIT.
-    Free tier supports this fully — Elasticsearch syntax does NOT work on free.
-
-    Strategy: job_title + location as primary filters (broad),
-    skills folded in as OR clauses so the LLM judge does the
-    real precision work downstream.
-    """
-    job_title = extracted.get("job_title", "").strip()
-    location  = extracted.get("location", "").strip()
-    skills    = extracted.get("required_skills", []) or []
-    certs     = extracted.get("required_certifications", []) or []
-
-    conditions = []
-
-    # ── Job title filter ──────────────────────────────────────
-    if job_title:
-        title_clean = job_title.replace("'", "''")
-        conditions.append(f"job_title LIKE '%{title_clean}%'")
-
-    # ── Location filter ───────────────────────────────────────
-    if location:
-        parts     = [p.strip() for p in location.split(",")]
-        city      = parts[0].replace("'", "''") if parts else ""
-        state     = parts[1].replace("'", "''") if len(parts) > 1 else ""
-        loc_parts = []
-        if city:
-            loc_parts.append(f"location_locality LIKE '%{city}%'")
-        if state:
-            loc_parts.append(f"location_region LIKE '%{state}%'")
-        if loc_parts:
-            conditions.append(f"({' OR '.join(loc_parts)})")
-
-    # ── Skills / certs as soft OR filter ─────────────────────
-    # Cap at 5 keywords to keep SQL clean on free tier.
-    all_keywords = list(set([
-        s.strip().replace("'", "''")
-        for s in (skills + certs)
-        if s and len(s.strip()) > 1
-    ]))[:5]
-
-    if all_keywords:
-        skill_clauses = [f"skills LIKE '%{kw}%'" for kw in all_keywords]
-        conditions.append(f"({' OR '.join(skill_clauses)})")
-
-    # ── Assemble final SQL ────────────────────────────────────
-    if not conditions:
-        return "SELECT * FROM person WHERE job_title LIKE '%therapist%' LIMIT 10"
-
-    where_clause = " AND ".join(conditions)
-    sql = f"SELECT * FROM person WHERE {where_clause} LIMIT 10"
-
-    print(f"[PDL] SQL query: {sql}")
-    return sql
+def _safe(s: str) -> str:
+    """Escape single quotes for PDL SQL."""
+    return s.replace("'", "''")
 
 
-def _build_fallback_sql(extracted: dict) -> str:
-    """Title + location only — drops skills filter. Last resort before empty state."""
-    job_title = extracted.get("job_title", "").strip().replace("'", "''")
-    location  = extracted.get("location", "").strip()
-    parts     = [p.strip() for p in location.split(",")]
-    city      = parts[0].replace("'", "''") if parts else ""
-    state     = parts[1].replace("'", "''") if len(parts) > 1 else ""
+def _parse_location(location: str):
+    """Returns (city, state) tuple from 'City, ST' string."""
+    parts = [p.strip() for p in location.split(",")]
+    city  = parts[0] if parts else ""
+    state = parts[1] if len(parts) > 1 else ""
+    return city, state
 
-    conditions = []
-    if job_title:
-        conditions.append(f"job_title LIKE '%{job_title}%'")
-    if city or state:
-        loc_parts = []
-        if city:
-            loc_parts.append(f"location_locality LIKE '%{city}%'")
-        if state:
-            loc_parts.append(f"location_region LIKE '%{state}%'")
-        conditions.append(f"({' OR '.join(loc_parts)})")
 
-    if not conditions:
-        return f"SELECT * FROM person WHERE job_title LIKE '%{job_title}%' LIMIT 10"
+def build_sql_city_state(job_title: str, city: str, state: str) -> str:
+    """Tightest query: title + city + state."""
+    return (
+        f"SELECT * FROM person "
+        f"WHERE job_title LIKE '%{_safe(job_title)}%' "
+        f"AND location_locality LIKE '%{_safe(city)}%' "
+        f"AND location_region LIKE '%{_safe(state)}%' "
+        f"LIMIT 10"
+    )
 
-    return f"SELECT * FROM person WHERE {' AND '.join(conditions)} LIMIT 10"
+
+def build_sql_state_only(job_title: str, state: str) -> str:
+    """Wider: title + state only — drops city requirement."""
+    return (
+        f"SELECT * FROM person "
+        f"WHERE job_title LIKE '%{_safe(job_title)}%' "
+        f"AND location_region LIKE '%{_safe(state)}%' "
+        f"LIMIT 10"
+    )
+
+
+def build_sql_title_only(job_title: str) -> str:
+    """Widest: title only — any location. Last resort."""
+    return (
+        f"SELECT * FROM person "
+        f"WHERE job_title LIKE '%{_safe(job_title)}%' "
+        f"LIMIT 10"
+    )
 
 
 # ─────────────────────────────────────────────────────────────
-# 2. PDL API CALL
+# 2. PDL API CALL  —  Geographic expansion ladder
+#
+# Tier 1: title + city + state   (most precise)
+# Tier 2: title + state          (drops city — covers whole state)
+# Tier 3: title only             (national — any location)
+#
+# Each tier only fires if the previous returned zero data rows.
+# Prints which tier succeeded so you can see it in the terminal.
 # ─────────────────────────────────────────────────────────────
 
 def fetch_pdl_candidates(extracted: dict, api_key: str) -> list:
-    """
-    Executes the PDL SQL search and returns raw person records.
-    Automatically retries with a relaxed title+location query
-    if the full query returns zero results.
-    """
+    job_title = extracted.get("job_title", "").strip()
+    location  = extracted.get("location", "").strip()
+    city, state = _parse_location(location)
+
     headers = {
         "Content-Type": "application/json",
         "X-Api-Key": api_key,
     }
 
-    def _run_query(sql: str) -> list:
+    def _run(sql: str, label: str) -> list:
+        print(f"[PDL] {label}: {sql}")
         payload  = {"sql": sql, "size": 10, "pretty": False}
-        response = requests.post(PDL_SQL_ENDPOINT, headers=headers, json=payload, timeout=15)
-        response.raise_for_status()
-        data     = response.json()
+        resp     = requests.post(PDL_SQL_ENDPOINT, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        data     = resp.json()
         profiles = data.get("data", [])
         total    = data.get("total", 0)
-        print(f"[PDL] Returned {len(profiles)} profiles | Total available: {total}")
+        print(f"[PDL] {label} → {len(profiles)} profiles returned | {total} total in index")
         return profiles
 
     try:
-        profiles = _run_query(build_pdl_sql(extracted))
+        # Tier 1 — city + state
+        if city and state:
+            profiles = _run(build_sql_city_state(job_title, city, state), "Tier 1 (city+state)")
+            if profiles:
+                return profiles
+            print("[PDL] Tier 1 empty — expanding to state-wide.")
 
-        if not profiles:
-            print("[PDL] Zero results — retrying with title+location only.")
-            profiles = _run_query(_build_fallback_sql(extracted))
+        # Tier 2 — state only
+        if state:
+            profiles = _run(build_sql_state_only(job_title, state), "Tier 2 (state only)")
+            if profiles:
+                return profiles
+            print("[PDL] Tier 2 empty — expanding to national.")
 
-        return profiles
+        # Tier 3 — title only, anywhere
+        profiles = _run(build_sql_title_only(job_title), "Tier 3 (title only / national)")
+        if profiles:
+            return profiles
+
+        print("[PDL] All tiers exhausted — no profiles found.")
+        return []
 
     except requests.exceptions.HTTPError:
         try:
-            err_body = response.json()
-            print(f"[PDL] HTTP {response.status_code}: {err_body.get('error', {}).get('message', '')}")
+            err = resp.json().get("error", {}).get("message", "")
+            print(f"[PDL] HTTP {resp.status_code}: {err}")
         except Exception:
             pass
         return []
     except requests.exceptions.Timeout:
-        print("[PDL] Request timed out after 15s.")
+        print("[PDL] Timed out.")
         return []
     except Exception as e:
-        print(f"[PDL] Unexpected error: {e}")
+        print(f"[PDL] Error: {e}")
         return []
 
 
@@ -161,11 +149,11 @@ def _extract_years_experience(profile: dict) -> str:
     experience = profile.get("experience", []) or []
     if not experience:
         return "N/A"
-    return str(len(experience)) + "+ roles"
+    return f"{len(experience)}+ roles"
 
 
 def _extract_skills(profile: dict) -> str:
-    raw   = profile.get("skills", []) or []
+    raw = profile.get("skills", []) or []
     names = []
     for s in raw:
         if isinstance(s, dict):
@@ -193,11 +181,12 @@ def _extract_education(profile: dict) -> str:
 
 
 def _build_location_string(profile: dict) -> str:
-    city    = profile.get("location_locality", "")
-    region  = profile.get("location_region", "")
-    country = profile.get("location_country", "")
-    parts   = [p for p in [city, region, country] if p]
-    return ", ".join(parts) if parts else "Unknown"
+    parts = [
+        profile.get("location_locality", ""),
+        profile.get("location_region", ""),
+        profile.get("location_country", ""),
+    ]
+    return ", ".join(p for p in parts if p) or "Unknown"
 
 
 def _build_background_summary(profile: dict) -> str:
@@ -269,59 +258,48 @@ def map_pdl_to_dataframe(profiles: list) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────
 
 def get_candidates_from_pdl(extracted: dict, api_key: str) -> pd.DataFrame:
-    """
-    Called by streamlit_app.py Step 2.
-    Replaces pd.read_csv("candidates.csv").
-    """
+    """Called by streamlit_app.py. Replaces pd.read_csv('candidates.csv')."""
     profiles = fetch_pdl_candidates(extracted, api_key)
     return map_pdl_to_dataframe(profiles)
 
 
 # ─────────────────────────────────────────────────────────────
-# 6. CORESIGNAL STUB — wire in when licensed
+# 6. CORESIGNAL STUB
 # ─────────────────────────────────────────────────────────────
 
 def _is_profile_thin(profile: dict) -> bool:
-    skills_count = len(profile.get("skills", []) or [])
-    has_summary  = bool(profile.get("summary", ""))
-    return not has_summary and skills_count < 3
+    return not profile.get("summary") and len(profile.get("skills", []) or []) < 3
 
 
 def enrich_with_coresignal(profile: dict, api_key: str) -> dict:
     """
-    STUB — Coresignal enrichment for thin PDL profiles.
-    TODO when licensed:
-      1. Hit Coresignal /v1/linkedin/member/search with profile linkedin_url
-      2. Merge returned fields into the PDL profile dict
-      3. Waterfall in get_candidates_from_pdl():
-         enriched = [enrich_with_coresignal(p, cs_key) if _is_profile_thin(p) else p for p in profiles]
+    STUB — wire in when licensed.
+    Waterfall becomes:
+      enriched = [enrich_with_coresignal(p, cs_key) if _is_profile_thin(p) else p for p in profiles]
     """
-    return profile  # pass-through until wired
+    return profile
 
 
-# ── Quick test harness ────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# 7. TEST HARNESS  —  python pdl_search.py
+# ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import os
+    import os, json
 
-    MOCK_EXTRACTED = {
+    MOCK = {
         "job_title": "Physical Therapist",
         "location": "Albany, NY",
         "required_skills": ["home health", "patient assessment", "rehabilitation"],
         "required_certifications": ["PT", "NYS license"],
-        "years_of_experience": 2,
-        "shift_type": None,
     }
 
     KEY = os.environ.get("PDL_API_KEY", "")
     if not KEY:
-        print("Set PDL_API_KEY env var to test.")
+        print("Set PDL_API_KEY env var first.")
     else:
-        import json
-        df = get_candidates_from_pdl(MOCK_EXTRACTED, KEY)
-        print(f"\n✅ DataFrame shape: {df.shape}")
-        print(f"Columns: {list(df.columns)}")
+        df = get_candidates_from_pdl(MOCK, KEY)
+        print(f"\n✅ Shape: {df.shape}")
         if not df.empty:
-            print("\nFirst record:\n")
             print(json.dumps(df.iloc[0].to_dict(), indent=2))
         else:
-            print("No profiles returned.")
+            print("No profiles returned across all tiers.")
