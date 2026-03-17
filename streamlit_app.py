@@ -362,16 +362,12 @@ if st.session_state.search_active:
 <div style="font-size: 0.9rem; color: var(--ink); line-height: 1.5; font-weight: 500;">{ai_reasoning}</div>
 </div>
 
-<div style="display: flex; gap: 2rem; margin-bottom: 1.2rem;">
-<div style="flex: 1; background: rgba(255,255,255,0.4); padding: 1rem; border-radius: 6px; border-left: 3px solid {status_color};">
+<div style="background: rgba(255,255,255,0.4); padding: 1rem; border-radius: 6px; border-left: 3px solid {status_color}; margin-bottom: 1.2rem;">
 <div style="font-family: 'DM Mono', monospace; font-size: 0.7rem; letter-spacing: 0.1em; color: var(--ink-muted); text-transform: uppercase; margin-bottom: 6px;">Contact Information</div>
 <div style="font-size: 0.9rem; font-weight: 500;">✉️ {candidate.get('Email', 'Hidden')}</div>
 <div style="font-size: 0.9rem; font-weight: 500; margin-top: 4px;">📞 {candidate.get('Phone', 'Hidden')} <span style="font-size: 0.75rem; color: {status_color};">({status_icon} {contact_status})</span></div>
 </div>
-<div style="flex: 1; display: flex; align-items: center; justify-content: center;">
-<button disabled style="background: var(--surface); color: var(--ink-muted); border: 2px dashed var(--shadow-dark); padding: 10px 20px; border-radius: 6px; font-family: 'Syne', sans-serif; font-weight: 600; cursor: not-allowed; width: 80%;" title="Integration available in enterprise tier.">+ Add to Outreach Pipeline</button>
-</div>
-</div>
+
 <div style="margin-bottom: 1.2rem;">
 <div style="font-family: 'DM Mono', monospace; font-size: 0.7rem; letter-spacing: 0.1em; color: var(--ink-muted); text-transform: uppercase; margin-bottom: 6px;">Background Summary</div>
 <div style="font-size: 0.95rem; line-height: 1.6; color: var(--ink); background: rgba(255,255,255,0.4); padding: 1rem; border-radius: 6px; border-left: 3px solid var(--border);">{candidate.get('Background_Summary', 'No summary provided.')}</div>
