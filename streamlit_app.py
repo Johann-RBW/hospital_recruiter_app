@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import os
 from groq import Groq
+from pdl_search import get_candidates_from_pdl
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -112,10 +113,19 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# ─────────────────────────────────────────────────────────────
+# API CLIENTS
+# ─────────────────────────────────────────────────────────────
 try:
     groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 except KeyError:
     st.error("⚠ GROQ_API_KEY is missing. Add it to .streamlit/secrets.toml.")
+    st.stop()
+
+try:
+    pdl_api_key = st.secrets["PDL_API_KEY"]
+except KeyError:
+    st.error("⚠ PDL_API_KEY is missing. Add it to .streamlit/secrets.toml.")
     st.stop()
 
 # ─────────────────────────────────────────────────────────────
@@ -161,7 +171,7 @@ if search_clicked:
         st.session_state.search_active = False
     else:
         st.session_state.search_active = True
-        
+
         # ── STEP 1: Groq Extraction ──────────────────────────
         with st.spinner("Parsing job description with LLaMA 3.1…"):
             extract_prompt = f"""
@@ -195,40 +205,62 @@ if search_clicked:
                 st.error(f"Groq extraction failed: {e}")
                 st.stop()
 
-        # ── STEP 2: Database Match & AI Scoring ───────────────────
-        with st.spinner("LLM reading resumes and generating clinical scores…"):
+        # ── STEP 2: PDL Candidate Fetch + AI Scoring ─────────
+        with st.spinner("Searching live candidate database via PDL…"):
             try:
-                df = pd.read_csv("candidates.csv")
-                
-                # Filter Location for UI
+                # ── LIVE PDL FETCH (replaces pd.read_csv) ─────
+                df = get_candidates_from_pdl(st.session_state.extracted_data, pdl_api_key)
+
+                if df.empty:
+                    st.warning("PDL returned no candidates for this search. Try broadening the job description.")
+                    st.session_state.filtered_df = pd.DataFrame()
+                    st.session_state.search_active = False
+                    st.stop()
+
+                # ── Location fallback logic (preserved from original) ──
                 ext_loc = st.session_state.extracted_data.get("location")
                 st.session_state.fallback_used = False
                 st.session_state.city = None
                 if ext_loc and str(ext_loc).lower() != "null":
                     st.session_state.city = ext_loc.split(",")[0].strip()
                     local_df = df[df["Location"].str.contains(st.session_state.city, case=False, na=False, regex=False)]
-                    if local_df.empty: st.session_state.fallback_used = True
-                
-                # --- STAGE 1: PYTHON SIFT (Fast Keyword Match) ---
+                    if local_df.empty:
+                        st.session_state.fallback_used = True
+
+                # ── STAGE 1: PYTHON SIFT (Fast Keyword Match) ─
                 req_skills = st.session_state.extracted_data.get("required_skills", []) or []
-                req_certs = st.session_state.extracted_data.get("required_certifications", []) or []
-                ext_title = str(st.session_state.extracted_data.get("job_title", "")).lower()
+                req_certs  = st.session_state.extracted_data.get("required_certifications", []) or []
+                ext_title  = str(st.session_state.extracted_data.get("job_title", "")).lower()
                 target_keywords = [str(k).lower().strip() for k in (req_skills + req_certs)]
-                if ext_title and ext_title != "null": target_keywords.extend([w for w in ext_title.split() if len(w) > 2])
+                if ext_title and ext_title != "null":
+                    target_keywords.extend([w for w in ext_title.split() if len(w) > 2])
                 target_keywords = list(set(target_keywords))
 
                 def sift_score(row):
-                    if not target_keywords: return 1
-                    cand_text = " ".join([str(row.get('Job Title','')), str(row.get('Skills','')), str(row.get('Certifications',''))]).lower()
+                    if not target_keywords:
+                        return 1
+                    cand_text = " ".join([
+                        str(row.get('Job Title', '')),
+                        str(row.get('Skills', '')),
+                        str(row.get('Certifications', ''))
+                    ]).lower()
                     return sum(1 for kw in target_keywords if kw in cand_text)
 
                 df['Sift_Hits'] = df.apply(sift_score, axis=1)
-                shortlist_df = df[df['Sift_Hits'] > 0].sort_values(by='Sift_Hits', ascending=False).head(10) # Grab top 10 for LLM
+                shortlist_df   = df[df['Sift_Hits'] > 0].sort_values(by='Sift_Hits', ascending=False).head(10)
 
-                # --- STAGE 2: LLM JUDGE (Intelligent Scoring) ---
-                if not shortlist_df.empty:
-                    candidates_payload = shortlist_df[['Name', 'Job Title', 'Skills', 'Certifications', 'Background_Summary', 'Years of Experience']].to_dict(orient='records')
-                    
+                # If sift produces nothing, pass all PDL results to the LLM
+                # (PDL already filtered by title+location so all are relevant)
+                if shortlist_df.empty:
+                    shortlist_df = df.head(10)
+
+                # ── STAGE 2: LLM JUDGE (Intelligent Scoring) ──
+                with st.spinner("LLM reading profiles and generating clinical scores…"):
+                    candidates_payload = shortlist_df[[
+                        'Name', 'Job Title', 'Skills', 'Certifications',
+                        'Background_Summary', 'Years of Experience'
+                    ]].to_dict(orient='records')
+
                     judge_prompt = f"""
                     You are an expert AI Recruiting Judge. 
                     Job Requirements: {json.dumps(st.session_state.extracted_data)}
@@ -240,30 +272,27 @@ if search_clicked:
                     Return ONLY a JSON object with a "results" array containing objects with "Name", "Match_Score" (integer), and "AI_Reasoning" (string).
                     Candidates: {json.dumps(candidates_payload)}
                     """
-                    
+
                     judge_response = groq_client.chat.completions.create(
                         messages=[{"role": "user", "content": judge_prompt}],
                         model="llama-3.1-8b-instant",
                         response_format={"type": "json_object"},
                         temperature=0.1,
                     )
-                    
+
                     ai_scores = json.loads(judge_response.choices[0].message.content).get("results", [])
-                    ai_df = pd.DataFrame(ai_scores)
-                    
-                    # Merge LLM brains back into main dataframe
-                    merged_df = shortlist_df.merge(ai_df, on="Name", how="inner")
+                    ai_df     = pd.DataFrame(ai_scores)
+
+                    merged_df = shortlist_df.merge(ai_df, on="Name", how="left")
                     if 'Match_Score' in merged_df.columns:
-                        merged_df['Match Score'] = merged_df['Match_Score']
+                        merged_df['Match Score'] = merged_df['Match_Score'].fillna(50).astype(int)
                     else:
-                        merged_df['Match Score'] = 50 # Fallback
-                        
+                        merged_df['Match Score'] = 50
+
                     st.session_state.filtered_df = merged_df.sort_values(by='Match Score', ascending=False)
-                else:
-                    st.session_state.filtered_df = pd.DataFrame()
 
             except Exception as e:
-                st.error(f"Database search error: {e}")
+                st.error(f"Candidate search error: {e}")
                 st.stop()
 
 
@@ -272,18 +301,18 @@ if search_clicked:
 # ─────────────────────────────────────────────────────────────
 if st.session_state.search_active:
     extracted_data = st.session_state.extracted_data
-    filtered_df = st.session_state.filtered_df
-    fallback_used = st.session_state.fallback_used
-    city = st.session_state.city
-    
+    filtered_df    = st.session_state.filtered_df
+    fallback_used  = st.session_state.fallback_used
+    city           = st.session_state.city
+
     st.markdown('<span class="section-label">02 — Extracted Requirements</span>', unsafe_allow_html=True)
 
     c1, c2, c3, c4 = st.columns(4)
     cards = [
-        (c1, "Role", extracted_data.get("job_title", "—"), "accent"),
-        (c2, "Location", extracted_data.get("location", "—"), "default"),
-        (c3, "Experience", str(extracted_data.get("years_of_experience","—")), "default"),
-        (c4, "Shift", extracted_data.get("shift_type") or "Unspecified", "default"),
+        (c1, "Role",       extracted_data.get("job_title", "—"),                    "accent"),
+        (c2, "Location",   extracted_data.get("location", "—"),                     "default"),
+        (c3, "Experience", str(extracted_data.get("years_of_experience", "—")),     "default"),
+        (c4, "Shift",      extracted_data.get("shift_type") or "Unspecified",       "default"),
     ]
     for col, lbl, val, kind in cards:
         with col:
@@ -294,7 +323,7 @@ if st.session_state.search_active:
 
     # ── MATCH RENDER ───────────────────────────
     st.markdown('<span class="section-label">03 — AI Scored Pipeline</span>', unsafe_allow_html=True)
-    
+
     if filtered_df.empty:
         st.info("No candidates strictly matched all criteria in this region. CandidateIQ's deep-search engine prevents unqualified profiles from entering your pipeline. Try broadening the job requirements.")
     else:
@@ -302,10 +331,10 @@ if st.session_state.search_active:
         if fallback_used and city:
             st.info(f"No exact city match for **{city}**. Showing {n} regional candidates with matching titles.")
 
-        dept = extracted_data.get("department") or "Healthcare"
+        dept      = extracted_data.get("department") or "Healthcare"
         top_score = f"{filtered_df['Match Score'].max()}%" if not filtered_df.empty else "N/A"
         avg_score = f"{int(filtered_df['Match Score'].mean())}%" if not filtered_df.empty else "N/A"
-            
+
         ms1, ms2, ms3 = st.columns(3)
         ms1.markdown(f'<div class="stat-card"><div class="stat-num">{n}</div><div class="stat-lbl">Shortlisted Candidates</div></div>', unsafe_allow_html=True)
         ms2.markdown(f'<div class="stat-card"><div class="stat-num">{top_score}</div><div class="stat-lbl" title="Generated by LLaMA 3.1 analysis.">Top AI Match Score ⓘ</div></div>', unsafe_allow_html=True)
@@ -317,30 +346,30 @@ if st.session_state.search_active:
 
         # ── INTERACTIVE DATAFRAME ─────────────────────────────
         base_cols = ["Name", "Job Title", "Match Score", "Company", "Location"]
-        if "Last_Active" in filtered_df.columns: base_cols.append("Last_Active")
-        
+        if "Last_Active" in filtered_df.columns:
+            base_cols.append("Last_Active")
+
         display_df = filtered_df[base_cols].copy()
         display_df = display_df.rename(columns={"Job Title": "Current Title"})
         display_df['Match Score'] = display_df['Match Score'].astype(str) + "%"
-        
+
         selection_event = st.dataframe(display_df, use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row")
 
         # ── CANDIDATE PROFILE CARD ────────────────────────────
         selected_rows = selection_event.selection.rows
         if selected_rows:
             candidate = filtered_df.iloc[selected_rows[0]]
-            
+
             contact_status = candidate.get('Contact_Status', 'Pending')
-            is_verified = "Verified" in str(contact_status)
-            status_color = "var(--accent-3)" if is_verified else "var(--accent)"
-            status_icon = "✅" if is_verified else "⚠️"
-            
+            is_verified    = "Verified" in str(contact_status)
+            status_color   = "var(--accent-3)" if is_verified else "var(--accent)"
+            status_icon    = "✅" if is_verified else "⚠️"
+
             ai_reasoning = candidate.get('AI_Reasoning', 'LLM reasoning successfully generated score based on clinical overlap.')
-            
+
             st.markdown("<br>", unsafe_allow_html=True)
             st.markdown('<span class="section-label">04 — Candidate Profile</span>', unsafe_allow_html=True)
-            
-            # Un-indented HTML to prevent Markdown code-block errors
+
             st.markdown(f"""
 <div class="neu-card" style="border-top: 6px solid var(--accent); padding: 2rem;">
 <div style="display: flex; justify-content: space-between; align-items: flex-start;">
