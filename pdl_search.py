@@ -16,25 +16,18 @@ PDL_SQL_ENDPOINT = "https://api.peopledatalabs.com/v5/person/search"
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. SQL QUERY BUILDER
-# Key design decision: NO skills in the SQL filter.
-#
-# Why: PDL free tier uses normalized skill tags ("physical therapy",
-# "home health") — Groq extracts narrative phrases ("NYS Licensure",
-# "Multidisciplinary Approach") that never match PDL's taxonomy.
-# Putting skills in SQL guarantees zero results.
-#
-# Instead: SQL = broad title + location funnel only.
-# The Python sift + LLM judge downstream handle all skill precision.
+# 1. SQL BUILDERS
+# No LIMIT in SQL — PDL rejects it. Size passed via payload.
+# No skills in SQL — Groq phrases never match PDL's taxonomy.
+# All queries pin to USA via location_country to avoid
+# international noise on the free tier dataset.
 # ─────────────────────────────────────────────────────────────
 
 def _safe(s: str) -> str:
-    """Escape single quotes for PDL SQL."""
     return s.replace("'", "''")
 
 
 def _parse_location(location: str):
-    """Returns (city, state) tuple from 'City, ST' string."""
     parts = [p.strip() for p in location.split(",")]
     city  = parts[0] if parts else ""
     state = parts[1] if len(parts) > 1 else ""
@@ -42,107 +35,140 @@ def _parse_location(location: str):
 
 
 def build_sql_city_state(job_title: str, city: str, state: str) -> str:
-    """Tightest query: title + city + state."""
     return (
         f"SELECT * FROM person "
         f"WHERE job_title LIKE '%{_safe(job_title)}%' "
         f"AND location_locality LIKE '%{_safe(city)}%' "
         f"AND location_region LIKE '%{_safe(state)}%' "
-        f"LIMIT 10"
+        f"AND location_country = 'united states'"
     )
 
 
 def build_sql_state_only(job_title: str, state: str) -> str:
-    """Wider: title + state only — drops city requirement."""
     return (
         f"SELECT * FROM person "
         f"WHERE job_title LIKE '%{_safe(job_title)}%' "
         f"AND location_region LIKE '%{_safe(state)}%' "
-        f"LIMIT 10"
+        f"AND location_country = 'united states'"
+    )
+
+
+def build_sql_us_only(job_title: str) -> str:
+    """Tier 3: US-wide. Drops state — keeps country filter."""
+    return (
+        f"SELECT * FROM person "
+        f"WHERE job_title LIKE '%{_safe(job_title)}%' "
+        f"AND location_country = 'united states'"
     )
 
 
 def build_sql_title_only(job_title: str) -> str:
-    """Widest: title only — any location. Last resort."""
+    """Tier 4: Global title match. Absolute last resort."""
     return (
         f"SELECT * FROM person "
-        f"WHERE job_title LIKE '%{_safe(job_title)}%' "
-        f"LIMIT 10"
+        f"WHERE job_title LIKE '%{_safe(job_title)}%'"
     )
 
 
 # ─────────────────────────────────────────────────────────────
-# 2. PDL API CALL  —  Geographic expansion ladder
-#
-# Tier 1: title + city + state   (most precise)
-# Tier 2: title + state          (drops city — covers whole state)
-# Tier 3: title only             (national — any location)
-#
-# Each tier only fires if the previous returned zero data rows.
-# Prints which tier succeeded so you can see it in the terminal.
+# 2. SINGLE API CALL HELPER
+# PDL returns HTTP 404 for "no records" — treat as empty, not error.
 # ─────────────────────────────────────────────────────────────
 
-def fetch_pdl_candidates(extracted: dict, api_key: str) -> list:
-    job_title = extracted.get("job_title", "").strip()
-    location  = extracted.get("location", "").strip()
+def _run_query(sql: str, label: str, api_key: str, verbose: bool = False) -> list:
+    print(f"[PDL] {label}: {sql}")
+    headers = {"Content-Type": "application/json", "X-Api-Key": api_key}
+    payload = {"sql": sql, "size": 10, "pretty": False}
+    resp    = requests.post(PDL_SQL_ENDPOINT, headers=headers, json=payload, timeout=15)
+
+    if verbose:
+        print(f"[PDL] HTTP status: {resp.status_code}")
+        print(f"[PDL] Raw response: {resp.text[:500]}")
+
+    # 404 = valid "no results" response on PDL — not a real HTTP error
+    if resp.status_code == 404:
+        print(f"[PDL] {label} → 0 profiles | 0 total")
+        return []
+
+    resp.raise_for_status()
+    data     = resp.json()
+    profiles = data.get("data", [])
+    total    = data.get("total", 0)
+    print(f"[PDL] {label} → {len(profiles)} profiles returned | {total} total in index")
+    return profiles
+
+
+# ─────────────────────────────────────────────────────────────
+# 3. GEOGRAPHIC EXPANSION LADDER
+# Tier 1: title + city + state + US
+# Tier 2: title + state + US
+# Tier 3: title + US only (national)
+# Tier 4: title only, global (absolute last resort)
+# ─────────────────────────────────────────────────────────────
+
+def fetch_pdl_candidates(extracted: dict, api_key: str, verbose: bool = False) -> list:
+    job_title   = extracted.get("job_title", "").strip()
+    location    = extracted.get("location", "").strip()
     city, state = _parse_location(location)
 
-    headers = {
-        "Content-Type": "application/json",
-        "X-Api-Key": api_key,
-    }
-
-    def _run(sql: str, label: str) -> list:
-        print(f"[PDL] {label}: {sql}")
-        payload  = {"sql": sql, "size": 10, "pretty": False}
-        resp     = requests.post(PDL_SQL_ENDPOINT, headers=headers, json=payload, timeout=15)
-        resp.raise_for_status()
-        data     = resp.json()
-        profiles = data.get("data", [])
-        total    = data.get("total", 0)
-        print(f"[PDL] {label} → {len(profiles)} profiles returned | {total} total in index")
-        return profiles
-
     try:
-        # Tier 1 — city + state
+        # Tier 1 — city + state + US
         if city and state:
-            profiles = _run(build_sql_city_state(job_title, city, state), "Tier 1 (city+state)")
+            profiles = _run_query(
+                build_sql_city_state(job_title, city, state),
+                "Tier 1 (city+state+US)", api_key, verbose
+            )
             if profiles:
                 return profiles
             print("[PDL] Tier 1 empty — expanding to state-wide.")
 
-        # Tier 2 — state only
+        # Tier 2 — state + US
         if state:
-            profiles = _run(build_sql_state_only(job_title, state), "Tier 2 (state only)")
+            profiles = _run_query(
+                build_sql_state_only(job_title, state),
+                "Tier 2 (state+US)", api_key, verbose
+            )
             if profiles:
                 return profiles
-            print("[PDL] Tier 2 empty — expanding to national.")
+            print("[PDL] Tier 2 empty — expanding to US-wide.")
 
-        # Tier 3 — title only, anywhere
-        profiles = _run(build_sql_title_only(job_title), "Tier 3 (title only / national)")
+        # Tier 3 — US national
+        profiles = _run_query(
+            build_sql_us_only(job_title),
+            "Tier 3 (US national)", api_key, verbose
+        )
+        if profiles:
+            return profiles
+        print("[PDL] Tier 3 empty — expanding to global.")
+
+        # Tier 4 — global, title only
+        profiles = _run_query(
+            build_sql_title_only(job_title),
+            "Tier 4 (global)", api_key, verbose
+        )
         if profiles:
             return profiles
 
         print("[PDL] All tiers exhausted — no profiles found.")
         return []
 
-    except requests.exceptions.HTTPError:
+    except requests.exceptions.HTTPError as e:
         try:
             err = resp.json().get("error", {}).get("message", "")
-            print(f"[PDL] HTTP {resp.status_code}: {err}")
+            print(f"[PDL] HTTP error: {err}")
         except Exception:
-            pass
+            print(f"[PDL] HTTP error: {e}")
         return []
     except requests.exceptions.Timeout:
         print("[PDL] Timed out.")
         return []
     except Exception as e:
-        print(f"[PDL] Error: {e}")
+        print(f"[PDL] Unexpected error: {type(e).__name__}: {e}")
         return []
 
 
 # ─────────────────────────────────────────────────────────────
-# 3. FIELD HELPERS
+# 4. FIELD HELPERS
 # ─────────────────────────────────────────────────────────────
 
 def _extract_years_experience(profile: dict) -> str:
@@ -209,8 +235,30 @@ def _build_background_summary(profile: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# 4. COLUMN MAPPER
+# 5. COLUMN MAPPER
+#
+# IMPORTANT — PDL free tier contact field behavior:
+# Fields like "work_email", "mobile_phone", "personal_emails"
+# are returned as BOOLEANS (true/false) on free tier, not strings.
+# true  = "this person has this data, upgrade to see it"
+# false = "we don't have this data at all"
+#
+# We map these to human-readable UI strings accordingly.
 # ─────────────────────────────────────────────────────────────
+
+def _resolve_contact_field(value, field_label: str) -> str:
+    """
+    Handles PDL's free-tier boolean contact fields.
+    - If it's already a real string (paid tier): return it
+    - If True (bool): data exists but is gated
+    - If False / None: data not available
+    """
+    if isinstance(value, str) and len(value) > 3:
+        return value                          # Paid tier — real value
+    if value is True:
+        return f"Available on licensed plan"  # Free tier — exists but gated
+    return "Not Available"
+
 
 def map_pdl_to_dataframe(profiles: list) -> pd.DataFrame:
     if not profiles:
@@ -228,11 +276,29 @@ def map_pdl_to_dataframe(profiles: list) -> pd.DataFrame:
         company_raw = p.get("job_company_name", "") or ""
         company     = str(company_raw) if company_raw else "N/A"
 
-        email          = p.get("work_email") or (p.get("personal_emails") or [None])[0] or "Not Available"
-        phone          = p.get("mobile_phone") or (p.get("phone_numbers") or [None])[0] or "Upgrade to access"
-        contact_status = "Verified" if p.get("work_email") else "Pending Verification"
-        last_updated   = p.get("last_updated", "")
-        last_active    = last_updated[:10] if last_updated else "Unknown"
+        # ── Contact fields ─────────────────────────────────────
+        # Free tier: these come back as True/False booleans
+        # Paid tier: these come back as actual strings
+        raw_email   = p.get("work_email") or (p.get("personal_emails") or [None])[0]
+        raw_phone   = p.get("mobile_phone") or (p.get("phone_numbers") or [None])[0]
+
+        # Check the top-level boolean flags PDL provides
+        has_email   = p.get("work_email") or p.get("recommended_personal_email") or p.get("personal_emails")
+        has_phone   = p.get("mobile_phone") or p.get("phone_numbers")
+
+        email = _resolve_contact_field(raw_email, "email")
+        if email == "Not Available" and has_email:
+            email = "Available on licensed plan"
+
+        phone = _resolve_contact_field(raw_phone, "phone")
+        if phone == "Not Available" and has_phone:
+            phone = "Available on licensed plan"
+
+        # Contact status: "Verified" if PDL confirmed they have contact data
+        contact_status = "Verified" if (has_email or has_phone) else "Pending Verification"
+
+        last_updated = p.get("last_updated", "") or p.get("job_last_verified", "")
+        last_active  = last_updated[:10] if last_updated else "Unknown"
 
         rows.append({
             "Name":                name,
@@ -254,7 +320,7 @@ def map_pdl_to_dataframe(profiles: list) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
-# 5. PUBLIC ENTRY POINT
+# 6. PUBLIC ENTRY POINT
 # ─────────────────────────────────────────────────────────────
 
 def get_candidates_from_pdl(extracted: dict, api_key: str) -> pd.DataFrame:
@@ -264,7 +330,7 @@ def get_candidates_from_pdl(extracted: dict, api_key: str) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
-# 6. CORESIGNAL STUB
+# 7. CORESIGNAL STUB
 # ─────────────────────────────────────────────────────────────
 
 def _is_profile_thin(profile: dict) -> bool:
@@ -274,17 +340,25 @@ def _is_profile_thin(profile: dict) -> bool:
 def enrich_with_coresignal(profile: dict, api_key: str) -> dict:
     """
     STUB — wire in when licensed.
-    Waterfall becomes:
+    Waterfall:
       enriched = [enrich_with_coresignal(p, cs_key) if _is_profile_thin(p) else p for p in profiles]
     """
     return profile
 
 
 # ─────────────────────────────────────────────────────────────
-# 7. TEST HARNESS  —  python pdl_search.py
+# 8. TEST HARNESS  —  python pdl_search.py
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import os, json
+
+    KEY = os.environ.get("PDL_API_KEY", "")
+    if not KEY:
+        print("❌ PDL_API_KEY not found in environment.")
+        print("   Run:  export PDL_API_KEY='your-key-here'  then retry.")
+        exit(1)
+
+    print(f"✅ Key loaded: {KEY[:6]}{'*' * (len(KEY) - 6)}\n")
 
     MOCK = {
         "job_title": "Physical Therapist",
@@ -293,13 +367,22 @@ if __name__ == "__main__":
         "required_certifications": ["PT", "NYS license"],
     }
 
-    KEY = os.environ.get("PDL_API_KEY", "")
-    if not KEY:
-        print("Set PDL_API_KEY env var first.")
+    profiles = fetch_pdl_candidates(MOCK, KEY, verbose=True)
+
+    print(f"\n--- RESULT ---")
+    print(f"Total profiles returned: {len(profiles)}")
+
+    if profiles:
+        print(f"\nFirst profile name:     {profiles[0].get('full_name')}")
+        print(f"Job title:              {profiles[0].get('job_title')}")
+        print(f"Location country:       {profiles[0].get('location_country')}")
+        print(f"Location region:        {profiles[0].get('location_region')}")
+        print(f"Location locality:      {profiles[0].get('location_locality')}")
+        print(f"work_email field:       {profiles[0].get('work_email')}")
+        print(f"mobile_phone field:     {profiles[0].get('mobile_phone')}")
+        print(f"personal_emails field:  {profiles[0].get('personal_emails')}")
+        print(f"\nMapped DataFrame row:")
+        df = map_pdl_to_dataframe(profiles)
+        print(json.dumps(df.iloc[0].to_dict(), indent=2))
     else:
-        df = get_candidates_from_pdl(MOCK, KEY)
-        print(f"\n✅ Shape: {df.shape}")
-        if not df.empty:
-            print(json.dumps(df.iloc[0].to_dict(), indent=2))
-        else:
-            print("No profiles returned across all tiers.")
+        print("No profiles returned across all tiers.")
