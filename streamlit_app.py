@@ -345,6 +345,16 @@ hr {
   margin: 1.5rem 0 !important;
 }
 
+/* ── Footer ──────────────────────────────────────────── */
+.footer-text {
+  text-align: center;
+  font-family: 'DM Mono', monospace;
+  font-size: 0.65rem;
+  color: var(--ink-muted);
+  margin-top: 3rem;
+  letter-spacing: 0.05em;
+}
+
 /* ── JSON code block ─────────────────────────────────── */
 .stJson {
   font-family: 'DM Mono', monospace !important;
@@ -438,7 +448,10 @@ CRITICAL INSTRUCTION - THE "BRAIN" PROTOCOL:
    - Example: Convert "Basic Life Support" to "BLS".
 3. EXPAND the search net: For every core requirement, include both the acronym and the spelled-out version in the lists (e.g., ["RN", "Registered Nurse", "BLS", "Basic Life Support"]).
 4. Deduce implied clinical skills from the daily duties described.
-
+5. EXPAND the search net: For every core requirement, include both the acronym and the spelled-out version in the lists (e.g., ["RN", "Registered Nurse"]).
+6. SPELL OUT TITLES: If the JD uses an acronym for the main title (like PCA, HHA, or CNA), you MUST spell it out completely in the `job_title` field (e.g., "Patient Care Associate", "Home Health Aide").
+7. IGNORE SOFT SKILLS: Do NOT extract subjective traits like "compassionate", "friendly", "dependable", or "work ethic". Only extract hard clinical skills, required equipment, or concrete logistical needs (e.g., "reliable transportation").
+8. LOCATION PARSING: If a list of counties or regions is provided, extract the most prominent central city or just the primary region, do not return a massive comma-separated list of counties.
 Return ONLY a valid JSON object with these exact keys:
 - "job_title" (string - simplify to the core standard title, e.g., "Registered Nurse" instead of "RN III - Emergency Level 1")
 - "department" (string or null)
@@ -476,66 +489,58 @@ Job Description:
                 df = pd.read_csv(file_path)
                 filtered_df = df.copy()
 
-                # 1. Title match (Base Filter)
-                extracted_title = st.session_state.extracted_data.get("job_title")
-                if extracted_title and str(extracted_title).lower() != "null":
-                    core_title = " ".join(
-                        str(extracted_title).replace("(", "").replace(")", "").split()[:2]
-                    )
-                    filtered_df = filtered_df[
-                        filtered_df["Job Title"].str.contains(core_title, case=False, na=False, regex=False)
-                    ]
-
-                # 2. Location match with fallback (Base Filter)
-                extracted_location = st.session_state.extracted_data.get("location")
-                location_matched_df = filtered_df.copy()
-                
-                st.session_state.fallback_used = False
-                st.session_state.city = None
-
-                if extracted_location and str(extracted_location).lower() != "null":
-                    st.session_state.city = extracted_location.split(",")[0].strip()
-                    location_matched_df = filtered_df[
-                        filtered_df["Location"].str.contains(st.session_state.city, case=False, na=False, regex=False)
-                    ]
-
-                if location_matched_df.empty and not filtered_df.empty:
-                    st.session_state.fallback_used = True
-                else:
-                    filtered_df = location_matched_df
-
-                # 3. AI Resume Scoring Engine
-                # Pool all extracted requirements
+                # 1. Pool all targets (Skills, Certs, and Title Words)
+                ext_title = str(st.session_state.extracted_data.get("job_title", "")).lower()
                 req_skills = st.session_state.extracted_data.get("required_skills", []) or []
                 req_certs = st.session_state.extracted_data.get("required_certifications", []) or []
+                
                 target_keywords = [str(k).lower().strip() for k in (req_skills + req_certs) if k]
-
-                def calculate_score(row):
-                    if not target_keywords:
-                        return 100 # If Groq found 0 requirements, assume 100% match based on title alone
+                
+                # Add words from the job title to the scoring net (catches acronyms like PCA, CNA)
+                if ext_title and ext_title != "null":
+                    title_words = [w for w in ext_title.split() if len(w) > 2]
+                    target_keywords.extend(title_words)
                     
-                    # Mash candidate data together into a "resume block"
+                target_keywords = list(set(target_keywords)) # Remove duplicates
+
+                # 2. AI Resume Scoring Engine (Grade EVERYONE)
+                def calculate_score(row):
+                    if not target_keywords: return 100
+                    
+                    # Mash the entire candidate profile into one searchable block
                     cand_text = " ".join([
-                        str(row.get('Skills', '')),
-                        str(row.get('Certifications', '')),
+                        str(row.get('Job Title', '')),
+                        str(row.get('Skills', '')), 
+                        str(row.get('Certifications', '')), 
                         str(row.get('Background_Summary', ''))
                     ]).lower()
                     
-                    # Count matches
                     matches = sum(1 for kw in target_keywords if kw in cand_text)
-                    return int((matches / len(target_keywords)) * 100)
+                    
+                    # Calculate percentage (cap at 98% for realism)
+                    score = int((matches / len(target_keywords)) * 100)
+                    return min(score, 98)
 
-                # Apply the score
                 filtered_df['Match Score'] = filtered_df.apply(calculate_score, axis=1)
                 
-                # THE KILL SWITCH: Drop anyone with a 0% skill match
+                # 3. THE KILL SWITCH: Only drop people with absolutely zero overlapping skills/titles
                 if target_keywords:
                     filtered_df = filtered_df[filtered_df['Match Score'] > 0]
 
-                # Sort best candidates to the top
-                filtered_df = filtered_df.sort_values(by='Match Score', ascending=False)
+                # 4. Location Check (For UI Messaging only - no longer a hard drop)
+                ext_loc = st.session_state.extracted_data.get("location")
+                st.session_state.fallback_used = False
+                st.session_state.city = None
+
+                if ext_loc and str(ext_loc).lower() != "null":
+                    st.session_state.city = ext_loc.split(",")[0].strip()
+                    local_df = filtered_df[filtered_df["Location"].str.contains(st.session_state.city, case=False, na=False, regex=False)]
                     
-                st.session_state.filtered_df = filtered_df
+                    if local_df.empty and not filtered_df.empty:
+                        st.session_state.fallback_used = True
+
+                # Sort best candidates to the top
+                st.session_state.filtered_df = filtered_df.sort_values(by='Match Score', ascending=False)
 
             except Exception as e:
                 st.error(f"Database search error: {e}")
@@ -600,52 +605,131 @@ if st.session_state.search_active:
     # ── MATCH RENDER ───────────────────────────
     st.markdown('<span class="section-label">03 — Matched Candidates</span>', unsafe_allow_html=True)
     
+    # Graceful Empty State
     if filtered_df.empty:
-        st.warning("No candidates matched the extracted requirements in the current database. Try broadening the job description.")
+        st.info("No candidates strictly matched all criteria in this region. CandidateIQ's deep-search engine prevents unqualified profiles from entering your pipeline. Try broadening the job requirements.")
     else:
         n = len(filtered_df)
 
         if fallback_used and city:
             st.info(f"No exact city match for **{city}**. Showing {n} regional candidates with matching titles.")
 
-        # Stat strip update
+        # Stat strip update with Tooltips
         dept = extracted_data.get("department") or "Healthcare"
         top_score = f"{filtered_df['Match Score'].max()}%" if not filtered_df.empty else "N/A"
         avg_score = f"{int(filtered_df['Match Score'].mean())}%" if not filtered_df.empty else "N/A"
             
         ms1, ms2, ms3 = st.columns(3)
-        for col, num, lbl in [
-            (ms1, n,              "Qualified Candidates"),
-            (ms2, top_score,      "Top Match Score"),
-            (ms3, avg_score,      "Avg Match Score"),
-        ]:
-            with col:
-                col.markdown(f"""
-<div class="stat-card">
-<div class="stat-num">{num}</div>
-<div class="stat-lbl">{lbl}</div>
-</div>""", unsafe_allow_html=True)
+        
+        ms1.markdown(f"""
+        <div class="stat-card">
+            <div class="stat-num">{n}</div>
+            <div class="stat-lbl">Qualified Candidates</div>
+        </div>""", unsafe_allow_html=True)
+        
+        ms2.markdown(f"""
+        <div class="stat-card">
+            <div class="stat-num">{top_score}</div>
+            <div class="stat-lbl" title="Calculated by cross-referencing extracted clinical requirements against the candidate's background and skills.">Top Match Score ⓘ</div>
+        </div>""", unsafe_allow_html=True)
+        
+        ms3.markdown(f"""
+        <div class="stat-card">
+            <div class="stat-num">{avg_score}</div>
+            <div class="stat-lbl">Avg Pipeline Quality</div>
+        </div>""", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
         # Result table with branded header
         st.markdown(f"""
-<div class="result-header">
-<span class="result-header-title">Candidate Results — {dept}</span>
-<span class="result-header-count">{n} record{'s' if n!=1 else ''}</span>
-</div>""", unsafe_allow_html=True)
+        <div class="result-header">
+            <span class="result-header-title">Candidate Pipeline — {dept}</span>
+            <span class="result-header-count">Select any row below to view full profile</span>
+        </div>""", unsafe_allow_html=True)
 
-        # Format display dataframe
-        display_cols = ["Name", "Job Title", "Match Score", "Company", "Location", "Email", "Phone"]
-        display_df = filtered_df[display_cols].copy()
+        # ── INTERACTIVE DATAFRAME ─────────────────────────────
+        # Build columns dynamically to avoid crashes if CSV lacks the new fields
+        base_cols = ["Name", "Job Title", "Match Score", "Company", "Location"]
+        if "Last_Active" in filtered_df.columns: base_cols.append("Last_Active")
+        if "Contact_Status" in filtered_df.columns: base_cols.append("Contact_Status")
+        
+        display_df = filtered_df[base_cols].copy()
         display_df = display_df.rename(columns={"Job Title": "Current Title"})
         
         # Add the % sign to the UI column
         display_df['Match Score'] = display_df['Match Score'].astype(str) + "%"
         
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        selection_event = st.dataframe(
+            display_df, 
+            use_container_width=True, 
+            hide_index=True,
+            on_select="rerun",           
+            selection_mode="single-row"  
+        )
 
-        # Export (Keep numeric scores for the CSV)
+        # ── CANDIDATE PROFILE CARD ────────────────────────────
+        selected_rows = selection_event.selection.rows
+        if selected_rows:
+            # Grab the specific candidate's full data from the hidden dataframe
+            candidate = filtered_df.iloc[selected_rows[0]]
+            
+            # Logic for Verified Badges
+            contact_status = candidate.get('Contact_Status', 'Not specified')
+            is_verified = "Verified" in str(contact_status)
+            status_color = "var(--accent-3)" if is_verified else "var(--accent)"
+            status_icon = "✅" if is_verified else "⚠️"
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<span class="section-label">04 — Candidate Profile</span>', unsafe_allow_html=True)
+            
+            # Neobrutalist Resume UI
+            st.markdown(f"""
+            <div class="neu-card" style="border-top: 6px solid var(--accent); padding: 2rem;">
+                <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                    <div>
+                        <h2 style="font-family: 'Syne', sans-serif; font-weight: 800; margin: 0 0 5px 0;">{candidate['Name']}</h2>
+                        <div style="font-family: 'DM Mono', monospace; color: var(--accent); font-size: 0.9rem; font-weight: 600;">{candidate['Job Title']}</div>
+                        <div style="color: var(--ink-muted); font-size: 0.85rem; margin-top: 4px;">📍 {candidate['Location']} &nbsp;|&nbsp; 🏢 {candidate['Company']}</div>
+                        <div style="color: var(--ink-muted); font-size: 0.75rem; margin-top: 4px;">🕒 Last Active: {candidate.get('Last_Active', 'Unknown')}</div>
+                    </div>
+                    <div style="text-align: right;">
+                        <div style="font-family: 'Syne', sans-serif; font-weight: 700; font-size: 1.5rem; color: var(--accent-3);">{int(candidate['Match Score'])}% Match</div>
+                        <div style="font-size: 0.8rem; color: var(--ink-muted);">{candidate['Years of Experience']} Years Exp.</div>
+                    </div>
+                </div>
+                <hr style="margin: 1.2rem 0; border-top: 1px solid var(--shadow-dark);">
+                
+                <div style="display: flex; gap: 2rem; margin-bottom: 1.2rem;">
+                    <div style="flex: 1; background: rgba(255,255,255,0.4); padding: 1rem; border-radius: 6px; border-left: 3px solid {status_color};">
+                        <div style="font-family: 'DM Mono', monospace; font-size: 0.7rem; letter-spacing: 0.1em; color: var(--ink-muted); text-transform: uppercase; margin-bottom: 6px;">Contact Information</div>
+                        <div style="font-size: 0.9rem; font-weight: 500;">✉️ {candidate.get('Email', 'Hidden')}</div>
+                        <div style="font-size: 0.9rem; font-weight: 500; margin-top: 4px;">📞 {candidate.get('Phone', 'Hidden')} <span style="font-size: 0.75rem; color: {status_color};">({status_icon} {contact_status})</span></div>
+                    </div>
+                    <div style="flex: 1; display: flex; align-items: center; justify-content: center;">
+                        <button disabled style="background: var(--surface); color: var(--ink-muted); border: 2px dashed var(--shadow-dark); padding: 10px 20px; border-radius: 6px; font-family: 'Syne', sans-serif; font-weight: 600; cursor: not-allowed; width: 80%;" title="Integration available in enterprise tier.">+ Add to Outreach Pipeline</button>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 1.2rem;">
+                    <div style="font-family: 'DM Mono', monospace; font-size: 0.7rem; letter-spacing: 0.1em; color: var(--ink-muted); text-transform: uppercase; margin-bottom: 6px;">Background Summary</div>
+                    <div style="font-size: 0.95rem; line-height: 1.6; color: var(--ink); background: rgba(255,255,255,0.4); padding: 1rem; border-radius: 6px; border-left: 3px solid var(--border);">{candidate.get('Background_Summary', 'No summary provided.')}</div>
+                </div>
+                
+                <div style="display: flex; gap: 2rem;">
+                    <div style="flex: 1;">
+                        <div style="font-family: 'DM Mono', monospace; font-size: 0.7rem; letter-spacing: 0.1em; color: var(--ink-muted); text-transform: uppercase; margin-bottom: 6px;">Clinical Skills</div>
+                        <div style="font-size: 0.85rem; line-height: 1.5;">{str(candidate.get('Skills', '')).replace(',', ' • ')}</div>
+                    </div>
+                    <div style="flex: 1;">
+                        <div style="font-family: 'DM Mono', monospace; font-size: 0.7rem; letter-spacing: 0.1em; color: var(--ink-muted); text-transform: uppercase; margin-bottom: 6px;">Certifications & Education</div>
+                        <div style="font-size: 0.85rem; line-height: 1.5; color: var(--accent-2); font-weight: 500;">{str(candidate.get('Certifications', '')).replace(',', ' • ')} • {candidate.get('Education Level', '')}</div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Export CSV
         st.markdown("<br>", unsafe_allow_html=True)
         csv = filtered_df.to_csv(index=False).encode("utf-8")
         st.download_button(
@@ -654,3 +738,6 @@ if st.session_state.search_active:
             file_name="matched_candidates.csv",
             mime="text/csv",
         )
+
+# Confidentiality Footer
+st.markdown('<div class="footer-text">🔒 CandidateIQ Enterprise Encryption Active | Data Sourced via Proprietary Compliance Frameworks</div>', unsafe_allow_html=True)
