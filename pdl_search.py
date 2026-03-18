@@ -17,10 +17,6 @@ PDL_SQL_ENDPOINT = "https://api.peopledatalabs.com/v5/person/search"
 
 # ─────────────────────────────────────────────────────────────
 # 1. SQL BUILDERS
-# No LIMIT in SQL — PDL rejects it. Size passed via payload.
-# No skills in SQL — Groq phrases never match PDL's taxonomy.
-# All queries pin to USA via location_country to avoid
-# international noise on the free tier dataset.
 # ─────────────────────────────────────────────────────────────
 
 def _safe(s: str) -> str:
@@ -54,7 +50,6 @@ def build_sql_state_only(job_title: str, state: str) -> str:
 
 
 def build_sql_us_only(job_title: str) -> str:
-    """Tier 3: US-wide. Drops state — keeps country filter."""
     return (
         f"SELECT * FROM person "
         f"WHERE job_title LIKE '%{_safe(job_title)}%' "
@@ -63,7 +58,6 @@ def build_sql_us_only(job_title: str) -> str:
 
 
 def build_sql_title_only(job_title: str) -> str:
-    """Tier 4: Global title match. Absolute last resort."""
     return (
         f"SELECT * FROM person "
         f"WHERE job_title LIKE '%{_safe(job_title)}%'"
@@ -71,8 +65,7 @@ def build_sql_title_only(job_title: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# 2. SINGLE API CALL HELPER
-# PDL returns HTTP 404 for "no records" — treat as empty, not error.
+# 2. API CALL + TIER LADDER
 # ─────────────────────────────────────────────────────────────
 
 def _run_query(sql: str, label: str, api_key: str, verbose: bool = False) -> list:
@@ -85,7 +78,6 @@ def _run_query(sql: str, label: str, api_key: str, verbose: bool = False) -> lis
         print(f"[PDL] HTTP status: {resp.status_code}")
         print(f"[PDL] Raw response: {resp.text[:500]}")
 
-    # 404 = valid "no results" response on PDL — not a real HTTP error
     if resp.status_code == 404:
         print(f"[PDL] {label} → 0 profiles | 0 total")
         return []
@@ -98,54 +90,30 @@ def _run_query(sql: str, label: str, api_key: str, verbose: bool = False) -> lis
     return profiles
 
 
-# ─────────────────────────────────────────────────────────────
-# 3. GEOGRAPHIC EXPANSION LADDER
-# Tier 1: title + city + state + US
-# Tier 2: title + state + US
-# Tier 3: title + US only (national)
-# Tier 4: title only, global (absolute last resort)
-# ─────────────────────────────────────────────────────────────
-
 def fetch_pdl_candidates(extracted: dict, api_key: str, verbose: bool = False) -> list:
     job_title   = extracted.get("job_title", "").strip()
     location    = extracted.get("location", "").strip()
     city, state = _parse_location(location)
 
     try:
-        # Tier 1 — city + state + US
         if city and state:
-            profiles = _run_query(
-                build_sql_city_state(job_title, city, state),
-                "Tier 1 (city+state+US)", api_key, verbose
-            )
+            profiles = _run_query(build_sql_city_state(job_title, city, state), "Tier 1 (city+state+US)", api_key, verbose)
             if profiles:
                 return profiles
             print("[PDL] Tier 1 empty — expanding to state-wide.")
 
-        # Tier 2 — state + US
         if state:
-            profiles = _run_query(
-                build_sql_state_only(job_title, state),
-                "Tier 2 (state+US)", api_key, verbose
-            )
+            profiles = _run_query(build_sql_state_only(job_title, state), "Tier 2 (state+US)", api_key, verbose)
             if profiles:
                 return profiles
             print("[PDL] Tier 2 empty — expanding to US-wide.")
 
-        # Tier 3 — US national
-        profiles = _run_query(
-            build_sql_us_only(job_title),
-            "Tier 3 (US national)", api_key, verbose
-        )
+        profiles = _run_query(build_sql_us_only(job_title), "Tier 3 (US national)", api_key, verbose)
         if profiles:
             return profiles
         print("[PDL] Tier 3 empty — expanding to global.")
 
-        # Tier 4 — global, title only
-        profiles = _run_query(
-            build_sql_title_only(job_title),
-            "Tier 4 (global)", api_key, verbose
-        )
+        profiles = _run_query(build_sql_title_only(job_title), "Tier 4 (global)", api_key, verbose)
         if profiles:
             return profiles
 
@@ -153,11 +121,7 @@ def fetch_pdl_candidates(extracted: dict, api_key: str, verbose: bool = False) -
         return []
 
     except requests.exceptions.HTTPError as e:
-        try:
-            err = resp.json().get("error", {}).get("message", "")
-            print(f"[PDL] HTTP error: {err}")
-        except Exception:
-            print(f"[PDL] HTTP error: {e}")
+        print(f"[PDL] HTTP error: {e}")
         return []
     except requests.exceptions.Timeout:
         print("[PDL] Timed out.")
@@ -168,39 +132,79 @@ def fetch_pdl_candidates(extracted: dict, api_key: str, verbose: bool = False) -
 
 
 # ─────────────────────────────────────────────────────────────
-# 4. FIELD HELPERS
+# 3. FIELD HELPERS
+#
+# PDL free tier returns many fields as booleans instead of real
+# values — true = "data exists, upgrade to see it".
+# Every helper below is defensively typed: if a field isn't the
+# expected type, we return a safe placeholder rather than crash.
 # ─────────────────────────────────────────────────────────────
 
+def _safe_str(value, fallback: str = "N/A") -> str:
+    """Return value as string only if it's actually a string. Otherwise fallback."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return fallback
+
+
+def _safe_list(value) -> list:
+    """Return value only if it's actually a list. Otherwise empty list."""
+    if isinstance(value, list):
+        return value
+    return []
+
+
 def _extract_years_experience(profile: dict) -> str:
-    experience = profile.get("experience", []) or []
+    experience = _safe_list(profile.get("experience"))
     if not experience:
         return "N/A"
     return f"{len(experience)}+ roles"
 
 
 def _extract_skills(profile: dict) -> str:
-    raw = profile.get("skills", []) or []
+    raw   = _safe_list(profile.get("skills"))
     names = []
     for s in raw:
         if isinstance(s, dict):
-            names.append(s.get("name", ""))
-        elif isinstance(s, str):
+            name = s.get("name", "")
+            if isinstance(name, str) and name:
+                names.append(name)
+        elif isinstance(s, str) and s:
             names.append(s)
-    return ", ".join(filter(None, names))
+    return ", ".join(names)
 
 
 def _extract_certifications(profile: dict) -> str:
-    raw = profile.get("certifications", []) or []
-    return ", ".join([c.get("name", "") for c in raw if isinstance(c, dict)])
+    raw   = _safe_list(profile.get("certifications"))
+    names = []
+    for c in raw:
+        if isinstance(c, dict):
+            name = c.get("name", "")
+            if isinstance(name, str) and name:
+                names.append(name)
+        elif isinstance(c, str) and c:
+            names.append(c)
+    return ", ".join(names)
 
 
 def _extract_education(profile: dict) -> str:
-    edu = profile.get("education", []) or []
+    edu = _safe_list(profile.get("education"))
     if not edu:
         return "N/A"
-    top    = edu[0]
-    degree = top.get("degrees", [""])[0] if top.get("degrees") else ""
-    school = top.get("school", {}).get("name", "") if isinstance(top.get("school"), dict) else ""
+    top = edu[0]
+    if not isinstance(top, dict):
+        return "N/A"
+
+    degrees_raw = top.get("degrees")
+    degree      = ""
+    if isinstance(degrees_raw, list) and degrees_raw:
+        degree = degrees_raw[0] if isinstance(degrees_raw[0], str) else ""
+
+    school_raw = top.get("school")
+    school     = ""
+    if isinstance(school_raw, dict):
+        school = _safe_str(school_raw.get("name"), "")
+
     if degree and school:
         return f"{degree} — {school}"
     return degree or school or "N/A"
@@ -208,57 +212,63 @@ def _extract_education(profile: dict) -> str:
 
 def _build_location_string(profile: dict) -> str:
     parts = [
-        profile.get("location_locality", ""),
-        profile.get("location_region", ""),
-        profile.get("location_country", ""),
+        _safe_str(profile.get("location_locality"), ""),
+        _safe_str(profile.get("location_region"), ""),
+        _safe_str(profile.get("location_country"), ""),
     ]
     return ", ".join(p for p in parts if p) or "Unknown"
 
 
 def _build_background_summary(profile: dict) -> str:
     summary = profile.get("summary", "")
-    if summary and len(summary) > 40:
+    if isinstance(summary, str) and len(summary) > 40:
         return summary
-    headline   = profile.get("headline", "")
-    experience = profile.get("experience", []) or []
+
+    headline   = _safe_str(profile.get("headline"), "")
+    experience = _safe_list(profile.get("experience"))
     recent_job = ""
-    if experience:
+
+    if experience and isinstance(experience[0], dict):
         exp       = experience[0]
         title     = exp.get("title", {})
-        title_str = title.get("name", "") if isinstance(title, dict) else str(title)
+        title_str = _safe_str(title.get("name") if isinstance(title, dict) else None, "")
         company   = exp.get("company", {})
-        co_str    = company.get("name", "") if isinstance(company, dict) else str(company)
+        co_str    = _safe_str(company.get("name") if isinstance(company, dict) else None, "")
         if title_str and co_str:
             recent_job = f"Most recently served as {title_str} at {co_str}."
+
     parts = [p for p in [headline, recent_job] if p]
     return " ".join(parts) if parts else "No summary available."
 
 
-# ─────────────────────────────────────────────────────────────
-# 5. COLUMN MAPPER
-#
-# IMPORTANT — PDL free tier contact field behavior:
-# Fields like "work_email", "mobile_phone", "personal_emails"
-# are returned as BOOLEANS (true/false) on free tier, not strings.
-# true  = "this person has this data, upgrade to see it"
-# false = "we don't have this data at all"
-#
-# We map these to human-readable UI strings accordingly.
-# ─────────────────────────────────────────────────────────────
+def _resolve_contact(profile: dict, field: str, list_field: str = None) -> str:
+    """
+    PDL free tier: contact fields are booleans (True = exists but gated).
+    PDL paid tier: contact fields are real strings/lists.
+    This handles both cleanly.
+    """
+    # Try direct field first
+    val = profile.get(field)
+    if isinstance(val, str) and len(val) > 3:
+        return val  # Paid tier — real value
 
-def _resolve_contact_field(value, field_label: str) -> str:
-    """
-    Handles PDL's free-tier boolean contact fields.
-    - If it's already a real string (paid tier): return it
-    - If True (bool): data exists but is gated
-    - If False / None: data not available
-    """
-    if isinstance(value, str) and len(value) > 3:
-        return value                          # Paid tier — real value
-    if value is True:
-        return f"Available on licensed plan"  # Free tier — exists but gated
+    # Try list field (e.g. personal_emails, phone_numbers)
+    if list_field:
+        lst = profile.get(list_field)
+        if isinstance(lst, list) and lst and isinstance(lst[0], str):
+            return lst[0]  # Paid tier — real value in list
+
+    # Boolean flags: True means data exists but is paywalled
+    bool_flag = profile.get(field) or (profile.get(list_field) if list_field else None)
+    if bool_flag is True:
+        return "Available on licensed plan"
+
     return "Not Available"
 
+
+# ─────────────────────────────────────────────────────────────
+# 4. COLUMN MAPPER
+# ─────────────────────────────────────────────────────────────
 
 def map_pdl_to_dataframe(profiles: list) -> pd.DataFrame:
     if not profiles:
@@ -266,39 +276,34 @@ def map_pdl_to_dataframe(profiles: list) -> pd.DataFrame:
 
     rows = []
     for p in profiles:
-        first = p.get("first_name", "") or ""
-        last  = p.get("last_name",  "") or ""
+        if not isinstance(p, dict):
+            continue
+
+        first = _safe_str(p.get("first_name"), "")
+        last  = _safe_str(p.get("last_name"),  "")
         name  = f"{first} {last}".strip() or "Unknown"
 
-        job_title_raw = p.get("job_title", "") or ""
-        job_title     = job_title_raw.get("name", "N/A") if isinstance(job_title_raw, dict) else str(job_title_raw) or "N/A"
+        job_title_raw = p.get("job_title", "")
+        if isinstance(job_title_raw, dict):
+            job_title = _safe_str(job_title_raw.get("name"), "N/A")
+        else:
+            job_title = _safe_str(job_title_raw, "N/A")
 
-        company_raw = p.get("job_company_name", "") or ""
-        company     = str(company_raw) if company_raw else "N/A"
+        company = _safe_str(p.get("job_company_name"), "N/A")
 
-        # ── Contact fields ─────────────────────────────────────
-        # Free tier: these come back as True/False booleans
-        # Paid tier: these come back as actual strings
-        raw_email   = p.get("work_email") or (p.get("personal_emails") or [None])[0]
-        raw_phone   = p.get("mobile_phone") or (p.get("phone_numbers") or [None])[0]
+        email = _resolve_contact(p, "work_email", "personal_emails")
+        # work_email on free tier is a bool — also check recommended_personal_email
+        if email == "Not Available":
+            rec = p.get("recommended_personal_email")
+            if rec is True:
+                email = "Available on licensed plan"
 
-        # Check the top-level boolean flags PDL provides
-        has_email   = p.get("work_email") or p.get("recommended_personal_email") or p.get("personal_emails")
-        has_phone   = p.get("mobile_phone") or p.get("phone_numbers")
+        phone          = _resolve_contact(p, "mobile_phone", "phone_numbers")
+        has_contact    = email != "Not Available" or phone != "Not Available"
+        contact_status = "Verified" if has_contact else "Pending Verification"
 
-        email = _resolve_contact_field(raw_email, "email")
-        if email == "Not Available" and has_email:
-            email = "Available on licensed plan"
-
-        phone = _resolve_contact_field(raw_phone, "phone")
-        if phone == "Not Available" and has_phone:
-            phone = "Available on licensed plan"
-
-        # Contact status: "Verified" if PDL confirmed they have contact data
-        contact_status = "Verified" if (has_email or has_phone) else "Pending Verification"
-
-        last_updated = p.get("last_updated", "") or p.get("job_last_verified", "")
-        last_active  = last_updated[:10] if last_updated else "Unknown"
+        last_updated = p.get("last_updated") or p.get("job_last_verified") or ""
+        last_active  = last_updated[:10] if isinstance(last_updated, str) and last_updated else "Unknown"
 
         rows.append({
             "Name":                name,
@@ -320,7 +325,7 @@ def map_pdl_to_dataframe(profiles: list) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
-# 6. PUBLIC ENTRY POINT
+# 5. PUBLIC ENTRY POINT
 # ─────────────────────────────────────────────────────────────
 
 def get_candidates_from_pdl(extracted: dict, api_key: str) -> pd.DataFrame:
@@ -330,11 +335,11 @@ def get_candidates_from_pdl(extracted: dict, api_key: str) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
-# 7. CORESIGNAL STUB
+# 6. CORESIGNAL STUB
 # ─────────────────────────────────────────────────────────────
 
 def _is_profile_thin(profile: dict) -> bool:
-    return not profile.get("summary") and len(profile.get("skills", []) or []) < 3
+    return not profile.get("summary") and len(_safe_list(profile.get("skills"))) < 3
 
 
 def enrich_with_coresignal(profile: dict, api_key: str) -> dict:
@@ -347,7 +352,7 @@ def enrich_with_coresignal(profile: dict, api_key: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-# 8. TEST HARNESS  —  python pdl_search.py
+# 7. TEST HARNESS  —  python pdl_search.py
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import os, json
@@ -373,16 +378,12 @@ if __name__ == "__main__":
     print(f"Total profiles returned: {len(profiles)}")
 
     if profiles:
-        print(f"\nFirst profile name:     {profiles[0].get('full_name')}")
-        print(f"Job title:              {profiles[0].get('job_title')}")
-        print(f"Location country:       {profiles[0].get('location_country')}")
-        print(f"Location region:        {profiles[0].get('location_region')}")
-        print(f"Location locality:      {profiles[0].get('location_locality')}")
-        print(f"work_email field:       {profiles[0].get('work_email')}")
-        print(f"mobile_phone field:     {profiles[0].get('mobile_phone')}")
-        print(f"personal_emails field:  {profiles[0].get('personal_emails')}")
-        print(f"\nMapped DataFrame row:")
         df = map_pdl_to_dataframe(profiles)
+        print(f"\nDataFrame shape: {df.shape}")
+        print(f"\nFirst mapped row:")
         print(json.dumps(df.iloc[0].to_dict(), indent=2))
+        print(f"\nAll names in result:")
+        for i, row in df.iterrows():
+            print(f"  {i+1}. {row['Name']} | {row['Job Title']} | {row['Location']}")
     else:
         print("No profiles returned across all tiers.")
