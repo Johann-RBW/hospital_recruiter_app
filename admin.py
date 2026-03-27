@@ -19,9 +19,8 @@ from auth import create_invite_token, get_db, init_db
 
 # ── CONFIGURE THIS ──────────────────────────────────────────
 # Your app's public URL (no trailing slash)
-APP_URL = "https://your-app.streamlit.app"   # <-- update this
+APP_URL = "https://healthcarecandidates.streamlit.app/"   # <-- update this
 # ────────────────────────────────────────────────────────────
-
 
 def cmd_invite(email: str):
     email = email.strip().lower()
