@@ -3,3 +3,5 @@ pandas==2.2.1
 python-dotenv==1.0.1
 groq
 requests==2.31.0
+# auth.py uses only Python stdlib: sqlite3, secrets, hashlib, datetime
+# No additional packages required for authentication
