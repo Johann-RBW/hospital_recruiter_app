@@ -10,7 +10,7 @@ from auth import (
     init_db,
 )
 
-# Initialize DB on startup — safe to call every run (CREATE IF NOT EXISTS)
+# Initialize DB — safe every run, uses CREATE IF NOT EXISTS
 init_db()
 
 # ─────────────────────────────────────────────────────────────
@@ -24,13 +24,126 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────────
-# CUSTOM CSS  —  Neobrutalism × Neumorphism hybrid
+# SESSION STATE INIT
 # ─────────────────────────────────────────────────────────────
-st.markdown("""
+defaults = {
+    "authenticated": False,
+    "user": None,
+    "search_active": False,
+    "extracted_data": {},
+    "filtered_df": pd.DataFrame(),
+    "fallback_used": False,
+    "city": None,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+# ─────────────────────────────────────────────────────────────
+# AUTH SCREENS  — pure Streamlit only, zero custom CSS/HTML
+# ─────────────────────────────────────────────────────────────
+
+def render_login():
+    _, col, _ = st.columns([1, 1.2, 1])
+    with col:
+        st.markdown("## ⬡ CandidateIQ")
+        st.caption("HEALTHCARE TALENT INTELLIGENCE")
+        st.divider()
+        st.markdown("### Sign In")
+
+        username = st.text_input("Username", key="login_username", placeholder="your username")
+        password = st.text_input("Password", key="login_password", type="password", placeholder="••••••••")
+
+        if st.button("Sign In →", type="primary", use_container_width=True):
+            if not username.strip() or not password.strip():
+                st.error("Please enter both username and password.")
+            else:
+                user = authenticate_user(username, password)
+                if user:
+                    login_user(st.session_state, user)
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+
+        st.divider()
+        st.caption("Access by invitation only · Contact your administrator")
+
+
+def render_signup(token: str):
+    invite = validate_invite_token(token)
+
+    _, col, _ = st.columns([1, 1.2, 1])
+    with col:
+        st.markdown("## ⬡ CandidateIQ")
+        st.caption("HEALTHCARE TALENT INTELLIGENCE")
+        st.divider()
+
+        if not invite:
+            st.error("This invite link is invalid or has expired.")
+            st.caption("Please contact your administrator for a new invite link.")
+            return
+
+        invited_email = invite["email"]
+        st.markdown("### Create Account")
+        st.caption(f"Invited as **{invited_email}**")
+
+        if email_already_registered(invited_email):
+            st.warning("An account for this email already exists.")
+            if st.button("Go to Sign In", type="primary"):
+                st.query_params.clear()
+                st.rerun()
+            return
+
+        username  = st.text_input("Choose a username",  key="signup_username",  placeholder="e.g. jsmith")
+        password  = st.text_input("Choose a password",  key="signup_password",  type="password", placeholder="Min 8 characters")
+        password2 = st.text_input("Confirm password",   key="signup_password2", type="password", placeholder="Re-enter password")
+
+        if st.button("Create Account →", type="primary", use_container_width=True):
+            uname  = username.strip().lower()
+            errors = []
+
+            if len(uname) < 3:
+                errors.append("Username must be at least 3 characters.")
+            if not uname.replace("_", "").replace("-", "").isalnum():
+                errors.append("Username can only contain letters, numbers, hyphens, and underscores.")
+            if username_exists(uname):
+                errors.append("That username is already taken.")
+            if len(password) < 8:
+                errors.append("Password must be at least 8 characters.")
+            if password != password2:
+                errors.append("Passwords do not match.")
+
+            if errors:
+                for e in errors:
+                    st.error(e)
+            else:
+                success = create_user(invited_email, uname, password)
+                if success:
+                    consume_invite_token(token)
+                    st.success(f"Account created! Welcome, {uname}. Signing you in…")
+                    user = authenticate_user(uname, password)
+                    if user:
+                        login_user(st.session_state, user)
+                        st.query_params.clear()
+                        st.rerun()
+                else:
+                    st.error("Account creation failed. Username or email may already exist.")
+
+        st.divider()
+        st.caption("Access by invitation only · Contact your administrator")
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN APP  — all custom CSS lives here, only loads post-auth
+# ─────────────────────────────────────────────────────────────
+
+def render_app():
+    # CSS only injected for authenticated sessions
+    st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap');
 
-/* ── Root Variables ─────────────────────────────────── */
 :root {
   --bg:          #E8E4DC;
   --surface:     #EAE6DE;
@@ -63,195 +176,31 @@ html, body, [class*="css"] {
 }
 [data-testid="stHeader"] { display: none !important; }
 
-/* ── Masthead ────────────────────────────────────────── */
 .masthead { display: flex; align-items: flex-end; gap: 1.2rem; padding: 2rem 0 0.25rem; border-bottom: var(--border-w) solid var(--border); margin-bottom: 2.2rem; }
 .masthead-mark { width: 44px; height: 44px; background: var(--accent); border: var(--border-w) solid var(--border); border-radius: var(--radius); display: flex; align-items: center; justify-content: center; font-size: 1.3rem; box-shadow: var(--brutalist-shadow); flex-shrink: 0; color: white;}
 .masthead-title { font-family: 'Syne', sans-serif; font-weight: 800; font-size: 1.75rem; letter-spacing: -0.03em; line-height: 1; color: var(--ink); }
 .masthead-sub { font-family: 'DM Mono', monospace; font-size: 0.7rem; color: var(--ink-muted); letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 3px; }
 .section-label { font-family: 'DM Mono', monospace; font-size: 0.65rem; letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-muted); margin-bottom: 0.5rem; display: block; }
-
-/* ── Components ─────────────────────────────────── */
 .neu-card { background: var(--surface); border-radius: 12px; box-shadow: var(--neu-shadow); border: var(--border-w) solid var(--border); padding: 1.6rem 1.8rem; margin-bottom: 1.4rem; position: relative; }
-.tag-row { display: flex; flex-wrap: wrap; gap: 0.45rem; margin-top: 0.5rem; }
-.tag { font-family: 'DM Mono', monospace; font-size: 0.7rem; font-weight: 500; padding: 3px 10px; border: 2px solid var(--border); border-radius: 3px; background: var(--surface); box-shadow: 2px 2px 0 var(--border); letter-spacing: 0.04em; color: var(--ink); }
-.tag-accent  { background: var(--accent);  color: #fff; border-color: var(--border); }
-.tag-accent2 { background: var(--accent-2); color: #fff; }
-
-/* ── Streamlit Overrides ────────────────────── */
-.stTextArea textarea { background: var(--surface) !important; box-shadow: var(--neu-inset) !important; border: var(--border-w) solid var(--border) !important; border-radius: var(--radius) !important; font-family: 'DM Sans', sans-serif !important; font-size: 0.9rem !important; color: var(--ink) !important; padding: 0.9rem 1rem !important; transition: box-shadow 0.2s ease; }
-.stTextArea textarea:focus { box-shadow: var(--neu-inset), 0 0 0 3px rgba(212,56,13,0.18) !important; outline: none !important; }
-.stTextInput input { background: var(--surface) !important; box-shadow: var(--neu-inset) !important; border: var(--border-w) solid var(--border) !important; border-radius: var(--radius) !important; font-family: 'DM Sans', sans-serif !important; font-size: 0.9rem !important; color: var(--ink) !important; padding: 0.55rem 1rem !important; }
-.stButton > button[kind="primary"] { background: var(--accent) !important; color: #fff !important; font-family: 'Syne', sans-serif !important; font-weight: 700 !important; font-size: 0.95rem !important; border: var(--border-w) solid var(--border) !important; border-radius: var(--radius) !important; padding: 0.55rem 2rem !important; box-shadow: var(--brutalist-shadow) !important; transition: transform 0.1s, box-shadow 0.1s !important; cursor: pointer !important; }
+.stTextArea textarea { background: var(--surface) !important; box-shadow: var(--neu-inset) !important; border: var(--border-w) solid var(--border) !important; border-radius: var(--radius) !important; font-family: 'DM Sans', sans-serif !important; font-size: 0.9rem !important; color: var(--ink) !important; padding: 0.9rem 1rem !important; }
+.stButton > button[kind="primary"] { background: var(--accent) !important; color: #fff !important; font-family: 'Syne', sans-serif !important; font-weight: 700 !important; font-size: 0.95rem !important; border: var(--border-w) solid var(--border) !important; border-radius: var(--radius) !important; padding: 0.55rem 2rem !important; box-shadow: var(--brutalist-shadow) !important; transition: transform 0.1s, box-shadow 0.1s !important; }
 .stButton > button[kind="primary"]:hover { transform: translate(-2px, -2px) !important; box-shadow: 6px 6px 0 var(--border) !important; }
 .stButton > button[kind="secondary"] { background: var(--surface) !important; color: var(--ink) !important; font-family: 'DM Mono', monospace !important; font-size: 0.8rem !important; border: var(--border-w) solid var(--border) !important; border-radius: var(--radius) !important; box-shadow: 3px 3px 0 var(--border) !important; }
 .stDownloadButton > button { background: var(--surface) !important; color: var(--ink) !important; font-family: 'DM Mono', monospace !important; font-size: 0.75rem !important; border: var(--border-w) solid var(--border) !important; border-radius: var(--radius) !important; box-shadow: 3px 3px 0 var(--border) !important; }
 .stDataFrame { border: var(--border-w) solid var(--border) !important; border-radius: var(--radius) !important; box-shadow: var(--neu-shadow) !important; overflow: hidden !important; }
 .stDataFrame thead tr th { background: var(--ink) !important; color: var(--bg) !important; font-family: 'DM Mono', monospace !important; font-size: 0.68rem !important; padding: 0.7rem 1rem !important; }
-.stat-card { background: var(--surface); border: var(--border-w) solid var(--border); border-radius: var(--radius); box-shadow: var(--neu-shadow); padding: 1rem 1.2rem; text-align: left; }
+.stat-card { background: var(--surface); border: var(--border-w) solid var(--border); border-radius: var(--radius); box-shadow: var(--neu-shadow); padding: 1rem 1.2rem; }
 .stat-card .stat-num { font-family: 'Syne', sans-serif; font-weight: 800; font-size: 2rem; line-height: 1; color: var(--accent); }
 .stat-card .stat-lbl { font-family: 'DM Mono', monospace; font-size: 0.62rem; letter-spacing: 0.15em; text-transform: uppercase; color: var(--ink-muted); margin-top: 4px; }
 .result-header { display: flex; justify-content: space-between; padding: 0.75rem 1rem; background: var(--ink); color: var(--bg); border-radius: var(--radius) var(--radius) 0 0; border: var(--border-w) solid var(--border); margin-bottom: -2px; }
 .result-header-title { font-family: 'Syne', sans-serif; font-weight: 700; font-size: 0.9rem; }
 hr { border: none !important; border-top: var(--border-w) solid var(--border) !important; margin: 1.5rem 0 !important; }
 .footer-text { text-align: center; font-family: 'DM Mono', monospace; font-size: 0.65rem; color: var(--ink-muted); margin-top: 3rem; }
-
-/* ── Auth Screens ───────────────────────────────── */
-.auth-wrap { max-width: 440px; margin: 5rem auto 0; }
-.auth-card { background: var(--surface); border-radius: 12px; box-shadow: var(--neu-shadow); border: var(--border-w) solid var(--border); padding: 2.4rem 2.6rem; }
-.auth-title { font-family: 'Syne', sans-serif; font-weight: 800; font-size: 1.4rem; margin-bottom: 0.25rem; color: var(--ink); }
-.auth-sub { font-family: 'DM Mono', monospace; font-size: 0.68rem; color: var(--ink-muted); letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 1.8rem; }
 .user-chip { display: inline-flex; align-items: center; gap: 0.5rem; font-family: 'DM Mono', monospace; font-size: 0.7rem; background: var(--surface); border: var(--border-w) solid var(--border); border-radius: 3px; padding: 4px 10px; box-shadow: 2px 2px 0 var(--border); color: var(--ink-muted); }
 </style>
 """, unsafe_allow_html=True)
 
-
-# ─────────────────────────────────────────────────────────────
-# SESSION STATE INIT
-# ─────────────────────────────────────────────────────────────
-defaults = {
-    "authenticated": False,
-    "user": None,
-    "auth_view": "login",        # "login" | "signup"
-    "search_active": False,
-    "extracted_data": {},
-    "filtered_df": pd.DataFrame(),
-    "fallback_used": False,
-    "city": None,
-}
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-
-# ─────────────────────────────────────────────────────────────
-# MASTHEAD  (always visible)
-# ─────────────────────────────────────────────────────────────
-def render_masthead(show_user: bool = False):
-    user_html = ""
-    if show_user and st.session_state.user:
-        uname = st.session_state.user["username"]
-        user_html = f'<div class="user-chip">⬡ {uname}</div>'
-
-    st.markdown(f"""
-<div class="masthead">
-  <div class="masthead-mark">⬡</div>
-  <div style="flex:1;">
-    <div class="masthead-sub">Healthcare Talent Intelligence</div>
-    <div class="masthead-title">CandidateIQ</div>
-  </div>
-  <div>{user_html}</div>
-</div>
-""", unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────────────────────
-# AUTH SCREENS
-# ─────────────────────────────────────────────────────────────
-
-def render_login():
-    render_masthead()
-    st.markdown('<div class="auth-wrap">', unsafe_allow_html=True)
-    st.markdown('<div class="auth-card">', unsafe_allow_html=True)
-    st.markdown('<div class="auth-title">Sign In</div>', unsafe_allow_html=True)
-    st.markdown('<div class="auth-sub">CandidateIQ · Secure Access</div>', unsafe_allow_html=True)
-
-    username = st.text_input("Username", key="login_username", placeholder="your username")
-    password = st.text_input("Password", key="login_password", type="password", placeholder="••••••••")
-
-    if st.button("Sign In →", type="primary", use_container_width=True):
-        if not username.strip() or not password.strip():
-            st.error("Please enter both username and password.")
-        else:
-            user = authenticate_user(username, password)
-            if user:
-                login_user(st.session_state, user)
-                st.rerun()
-            else:
-                st.error("Invalid username or password.")
-
-    st.markdown("</div></div>", unsafe_allow_html=True)
-    st.markdown('<div class="footer-text">Access by invitation only · Contact your administrator</div>', unsafe_allow_html=True)
-
-
-def render_signup(token: str):
-    invite = validate_invite_token(token)
-    render_masthead()
-
-    if not invite:
-        st.markdown('<div class="auth-wrap">', unsafe_allow_html=True)
-        st.markdown('<div class="auth-card">', unsafe_allow_html=True)
-        st.error("This invite link is invalid or has expired. Please contact your administrator for a new one.")
-        st.markdown("</div></div>", unsafe_allow_html=True)
-        return
-
-    invited_email = invite["email"]
-
-    st.markdown('<div class="auth-wrap">', unsafe_allow_html=True)
-    st.markdown('<div class="auth-card">', unsafe_allow_html=True)
-    st.markdown('<div class="auth-title">Create Account</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="auth-sub">Invited as {invited_email}</div>', unsafe_allow_html=True)
-
-    if email_already_registered(invited_email):
-        st.warning("An account for this email already exists. Please sign in.")
-        if st.button("Go to Sign In", type="primary"):
-            st.query_params.clear()
-            st.rerun()
-        st.markdown("</div></div>", unsafe_allow_html=True)
-        return
-
-    username = st.text_input("Choose a username", key="signup_username", placeholder="e.g. jsmith")
-    password = st.text_input("Choose a password", key="signup_password", type="password", placeholder="Min 8 characters")
-    password2 = st.text_input("Confirm password", key="signup_password2", type="password", placeholder="Re-enter password")
-
-    if st.button("Create Account →", type="primary", use_container_width=True):
-        uname = username.strip().lower()
-        errors = []
-
-        if len(uname) < 3:
-            errors.append("Username must be at least 3 characters.")
-        if not uname.replace("_","").replace("-","").isalnum():
-            errors.append("Username can only contain letters, numbers, hyphens, and underscores.")
-        if username_exists(uname):
-            errors.append("That username is already taken.")
-        if len(password) < 8:
-            errors.append("Password must be at least 8 characters.")
-        if password != password2:
-            errors.append("Passwords do not match.")
-
-        if errors:
-            for e in errors:
-                st.error(e)
-        else:
-            success = create_user(invited_email, uname, password)
-            if success:
-                consume_invite_token(token)
-                st.success(f"Account created! Welcome, {uname}. Signing you in…")
-                user = authenticate_user(uname, password)
-                if user:
-                    login_user(st.session_state, user)
-                    st.query_params.clear()
-                    st.rerun()
-            else:
-                st.error("Account creation failed. Username or email may already exist.")
-
-    st.markdown("</div></div>", unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────────────────────
-# MAIN APP  (only visible when authenticated)
-# ─────────────────────────────────────────────────────────────
-
-def render_app():
-    render_masthead(show_user=True)
-
-    # Logout button — top right
-    _, col_logout = st.columns([6, 1])
-    with col_logout:
-        if st.button("Sign Out", type="secondary"):
-            logout_user(st.session_state)
-            st.rerun()
-
-    # ── API CLIENTS ────────────────────────────────────────
+    # ── LAZY IMPORTS (only when authenticated user reaches the app)
     from groq import Groq
     from pdl_search import get_candidates_from_pdl
 
@@ -266,6 +215,25 @@ def render_app():
     except KeyError:
         st.error("⚠ PDL_API_KEY is missing. Add it to .streamlit/secrets.toml.")
         st.stop()
+
+    # ── MASTHEAD ───────────────────────────────────────────
+    uname = st.session_state.user["username"]
+    st.markdown(f"""
+<div class="masthead">
+  <div class="masthead-mark">⬡</div>
+  <div style="flex:1;">
+    <div class="masthead-sub">Healthcare Talent Intelligence</div>
+    <div class="masthead-title">CandidateIQ</div>
+  </div>
+  <div class="user-chip">⬡ {uname}</div>
+</div>
+""", unsafe_allow_html=True)
+
+    _, col_logout = st.columns([6, 1])
+    with col_logout:
+        if st.button("Sign Out", type="secondary"):
+            logout_user(st.session_state)
+            st.rerun()
 
     # ── LAYOUT ────────────────────────────────────────────
     col_input, col_tip = st.columns([2, 1], gap="large")
@@ -344,7 +312,7 @@ def render_app():
                     df = get_candidates_from_pdl(st.session_state.extracted_data, pdl_api_key)
 
                     if df.empty:
-                        st.warning("PDL returned no candidates for this search. Try broadening the job description.")
+                        st.warning("PDL returned no candidates. Try broadening the job description.")
                         st.session_state.filtered_df = pd.DataFrame()
                         st.session_state.search_active = False
                         st.stop()
@@ -358,9 +326,9 @@ def render_app():
                         if local_df.empty:
                             st.session_state.fallback_used = True
 
-                    req_skills = st.session_state.extracted_data.get("required_skills", []) or []
-                    req_certs  = st.session_state.extracted_data.get("required_certifications", []) or []
-                    ext_title  = str(st.session_state.extracted_data.get("job_title", "")).lower()
+                    req_skills      = st.session_state.extracted_data.get("required_skills", []) or []
+                    req_certs       = st.session_state.extracted_data.get("required_certifications", []) or []
+                    ext_title       = str(st.session_state.extracted_data.get("job_title", "")).lower()
                     target_keywords = [str(k).lower().strip() for k in (req_skills + req_certs)]
                     if ext_title and ext_title != "null":
                         target_keywords.extend([w for w in ext_title.split() if len(w) > 2])
@@ -377,7 +345,7 @@ def render_app():
                         return sum(1 for kw in target_keywords if kw in cand_text)
 
                     df['Sift_Hits'] = df.apply(sift_score, axis=1)
-                    shortlist_df   = df[df['Sift_Hits'] > 0].sort_values(by='Sift_Hits', ascending=False).head(10)
+                    shortlist_df    = df[df['Sift_Hits'] > 0].sort_values(by='Sift_Hits', ascending=False).head(10)
 
                     if shortlist_df.empty:
                         shortlist_df = df.head(10)
@@ -392,7 +360,7 @@ def render_app():
                         You are an expert AI Recruiting Judge.
                         Job Requirements: {json.dumps(st.session_state.extracted_data)}
 
-                        Here are {len(candidates_payload)} candidates. Read their profiles and score them from 0 to 98 based on how well they fit the requirements.
+                        Here are {len(candidates_payload)} candidates. Score them 0–98 on fit.
                         - Prioritize active licenses, exact required certifications, and years of experience.
                         - Provide a 1-sentence analytical reasoning explaining the score.
 
@@ -409,8 +377,8 @@ def render_app():
 
                         ai_scores = json.loads(judge_response.choices[0].message.content).get("results", [])
                         ai_df     = pd.DataFrame(ai_scores)
-
                         merged_df = shortlist_df.merge(ai_df, on="Name", how="left")
+
                         if 'Match_Score' in merged_df.columns:
                             merged_df['Match Score'] = merged_df['Match_Score'].fillna(50).astype(int)
                         else:
@@ -433,10 +401,10 @@ def render_app():
 
         c1, c2, c3, c4 = st.columns(4)
         cards = [
-            (c1, "Role",       extracted_data.get("job_title", "—"),                    "accent"),
-            (c2, "Location",   extracted_data.get("location", "—"),                     "default"),
-            (c3, "Experience", str(extracted_data.get("years_of_experience", "—")),     "default"),
-            (c4, "Shift",      extracted_data.get("shift_type") or "Unspecified",       "default"),
+            (c1, "Role",       extracted_data.get("job_title", "—"),                "accent"),
+            (c2, "Location",   extracted_data.get("location", "—"),                 "default"),
+            (c3, "Experience", str(extracted_data.get("years_of_experience", "—")), "default"),
+            (c4, "Shift",      extracted_data.get("shift_type") or "Unspecified",   "default"),
         ]
         for col, lbl, val, kind in cards:
             with col:
@@ -444,28 +412,26 @@ def render_app():
                 col.markdown(f"""<div class="neu-card" style="border-left: 4px solid {border_color}; padding: 0.9rem 1.1rem;"><div style="font-family:'DM Mono',monospace;font-size:0.6rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--ink-muted);">{lbl}</div><div style="font-family:'Syne',sans-serif;font-weight:700;font-size:1rem;margin-top:4px;line-height:1.2;">{val}</div></div>""", unsafe_allow_html=True)
 
         st.markdown("<hr>", unsafe_allow_html=True)
-
         st.markdown('<span class="section-label">03 — AI Scored Pipeline</span>', unsafe_allow_html=True)
 
         if filtered_df.empty:
-            st.info("No candidates strictly matched all criteria in this region. CandidateIQ's deep-search engine prevents unqualified profiles from entering your pipeline. Try broadening the job requirements.")
+            st.info("No candidates matched all criteria. Try broadening the job requirements.")
         else:
-            n = len(filtered_df)
-            if fallback_used and city:
-                st.info(f"No exact city match for **{city}**. Showing {n} regional candidates with matching titles.")
-
+            n         = len(filtered_df)
             dept      = extracted_data.get("department") or "Healthcare"
             top_score = f"{filtered_df['Match Score'].max()}%" if not filtered_df.empty else "N/A"
             avg_score = f"{int(filtered_df['Match Score'].mean())}%" if not filtered_df.empty else "N/A"
 
+            if fallback_used and city:
+                st.info(f"No exact city match for **{city}**. Showing {n} regional candidates.")
+
             ms1, ms2, ms3 = st.columns(3)
             ms1.markdown(f'<div class="stat-card"><div class="stat-num">{n}</div><div class="stat-lbl">Shortlisted Candidates</div></div>', unsafe_allow_html=True)
-            ms2.markdown(f'<div class="stat-card"><div class="stat-num">{top_score}</div><div class="stat-lbl" title="Generated by LLaMA 3.1 analysis.">Top AI Match Score ⓘ</div></div>', unsafe_allow_html=True)
+            ms2.markdown(f'<div class="stat-card"><div class="stat-num">{top_score}</div><div class="stat-lbl">Top AI Match Score</div></div>', unsafe_allow_html=True)
             ms3.markdown(f'<div class="stat-card"><div class="stat-num">{avg_score}</div><div class="stat-lbl">Avg Pipeline Quality</div></div>', unsafe_allow_html=True)
 
             st.markdown("<br>", unsafe_allow_html=True)
-
-            st.markdown(f'<div class="result-header"><span class="result-header-title">Candidate Pipeline — {dept}</span><span class="result-header-count">Select any row below to view full profile</span></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="result-header"><span class="result-header-title">Candidate Pipeline — {dept}</span><span>Select any row to view full profile</span></div>', unsafe_allow_html=True)
 
             base_cols = ["Name", "Job Title", "Match Score", "Company", "Location"]
             if "Last_Active" in filtered_df.columns:
@@ -479,13 +445,12 @@ def render_app():
 
             selected_rows = selection_event.selection.rows
             if selected_rows:
-                candidate = filtered_df.iloc[selected_rows[0]]
-
+                candidate      = filtered_df.iloc[selected_rows[0]]
                 contact_status = candidate.get('Contact_Status', 'Pending')
                 is_verified    = "Verified" in str(contact_status)
                 status_color   = "var(--accent-3)" if is_verified else "var(--accent)"
                 status_icon    = "✅" if is_verified else "⚠️"
-                ai_reasoning   = candidate.get('AI_Reasoning', 'LLM reasoning successfully generated score based on clinical overlap.')
+                ai_reasoning   = candidate.get('AI_Reasoning', 'Score generated based on clinical overlap.')
 
                 st.markdown("<br>", unsafe_allow_html=True)
                 st.markdown('<span class="section-label">04 — Candidate Profile</span>', unsafe_allow_html=True)
@@ -539,17 +504,13 @@ def render_app():
 
 
 # ─────────────────────────────────────────────────────────────
-# ROUTER  —  entry point
+# ROUTER  — no CSS, no imports, just route and render
 # ─────────────────────────────────────────────────────────────
-params = st.query_params
-invite_token = params.get("invite", None)
+invite_token = st.query_params.get("invite", None)
 
 if invite_token:
-    # Signup flow — only accessible via invite link
     render_signup(invite_token)
 elif is_logged_in(st.session_state):
-    # Authenticated — show the full app
     render_app()
 else:
-    # Unauthenticated — show login
     render_login()
