@@ -12,6 +12,22 @@ from auth import (
     init_db,
 )
 
+import sys
+st.write(sys.version)
+try:
+    from groq import Groq
+    st.write("groq OK")
+except Exception as e:
+    st.error(f"groq import failed: {e}")
+
+try:
+    from pdl_search import get_candidates_from_pdl
+    st.write("pdl_search OK")
+except Exception as e:
+    st.error(f"pdl_search import failed: {e}")
+
+st.stop()
+
 # Initialize DB — safe every run, uses CREATE IF NOT EXISTS
 init_db()
 
