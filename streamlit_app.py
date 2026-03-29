@@ -2,8 +2,6 @@ import streamlit as st
 import pandas as pd
 import json
 import os
-from groq import Groq
-from pdl_search import get_candidates_from_pdl
 from auth import (
     is_logged_in, login_user, logout_user,
     authenticate_user, create_user,
@@ -254,6 +252,9 @@ def render_app():
             st.rerun()
 
     # ── API CLIENTS ────────────────────────────────────────
+    from groq import Groq
+    from pdl_search import get_candidates_from_pdl
+
     try:
         groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
     except KeyError:
