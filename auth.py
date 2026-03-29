@@ -10,7 +10,7 @@ import hashlib
 import os
 from datetime import datetime, timedelta, timezone
 
-DB_PATH = os.environ.get("AUTH_DB_PATH", "candidateiq_auth.db")
+DB_PATH = os.environ.get("AUTH_DB_PATH", "/tmp/candidateiq_auth.db")
 TOKEN_EXPIRY_HOURS = 48
 
 
@@ -211,7 +211,4 @@ def logout_user(session_state):
     session_state["user"] = None
 
 
-# ─────────────────────────────────────────────────────────────
-# STARTUP
-# ─────────────────────────────────────────────────────────────
-init_db()
+# init_db() is called explicitly from streamlit_app.py — not at import time.

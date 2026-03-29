@@ -19,8 +19,14 @@ from auth import create_invite_token, get_db, init_db
 
 # ── CONFIGURE THIS ──────────────────────────────────────────
 # Your app's public URL (no trailing slash)
-APP_URL = "https://candidateiq.streamlit.app/"   # <-- update this
+APP_URL = "https://candidateiq.streamlit.app"   # <-- update this
+
+# NOTE: On Streamlit Cloud, the DB lives at /tmp/candidateiq_auth.db
+# To run admin commands against the live DB you have two options:
+#   1. Use Streamlit Cloud's terminal (Resources tab) — DB is at /tmp/
+#   2. Set AUTH_DB_PATH env var to point to your local copy for testing
 # ────────────────────────────────────────────────────────────
+
 
 def cmd_invite(email: str):
     email = email.strip().lower()

@@ -9,7 +9,11 @@ from auth import (
     authenticate_user, create_user,
     validate_invite_token, consume_invite_token,
     username_exists, email_already_registered,
+    init_db,
 )
+
+# Initialize DB on startup — safe to call every run (CREATE IF NOT EXISTS)
+init_db()
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG
