@@ -504,11 +504,97 @@ hr { border: none !important; border-top: var(--border-w) solid var(--border) !i
 
 
 # ─────────────────────────────────────────────────────────────
+# ADMIN PANEL  — hidden route /?admin=1, password-protected
+# Generates invite links directly against the live DB
+# ─────────────────────────────────────────────────────────────
+
+def render_admin():
+    from auth import create_invite_token, get_db
+
+    _, col, _ = st.columns([1, 1.5, 1])
+    with col:
+        st.markdown("## ⬡ CandidateIQ Admin")
+        st.caption("INTERNAL — DO NOT SHARE THIS URL")
+        st.divider()
+
+        # Gate with admin password from secrets
+        try:
+            admin_password = st.secrets["ADMIN_PASSWORD"]
+        except KeyError:
+            st.error("ADMIN_PASSWORD not set in secrets.toml")
+            return
+
+        if not st.session_state.get("admin_authed"):
+            pwd = st.text_input("Admin password", type="password", key="admin_pwd_input")
+            if st.button("Unlock", type="primary"):
+                if pwd == admin_password:
+                    st.session_state["admin_authed"] = True
+                    st.rerun()
+                else:
+                    st.error("Wrong password.")
+            return
+
+        # ── INVITE ────────────────────────────────────────
+        st.markdown("### Generate Invite Link")
+        email = st.text_input("User email", placeholder="client@company.com", key="admin_email")
+        app_url = st.secrets.get("APP_URL", "https://your-app.streamlit.app").rstrip("/")
+
+        if st.button("Generate Link", type="primary"):
+            email = email.strip().lower()
+            if not email or "@" not in email:
+                st.error("Enter a valid email address.")
+            else:
+                token = create_invite_token(email)
+                link  = f"{app_url}/?invite={token}"
+                st.success(f"Invite created for **{email}**")
+                st.code(link, language=None)
+                st.caption("Link expires in 48 hours. Copy and send it to the user.")
+
+        st.divider()
+
+        # ── USER LIST ─────────────────────────────────────
+        st.markdown("### Registered Users")
+        with get_db() as conn:
+            users = conn.execute(
+                "SELECT username, email, created_at, is_active FROM users ORDER BY id DESC"
+            ).fetchall()
+
+        if not users:
+            st.caption("No users registered yet.")
+        else:
+            for u in users:
+                status = "✅ Active" if u["is_active"] else "🔴 Deactivated"
+                st.markdown(f"**{u['username']}** · {u['email']} · {status} · joined {u['created_at'][:10]}")
+
+        st.divider()
+
+        # ── DEACTIVATE ────────────────────────────────────
+        st.markdown("### Deactivate / Reactivate User")
+        target = st.text_input("Username", key="admin_deact_username")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("Deactivate", type="secondary"):
+                with get_db() as conn:
+                    c = conn.execute("UPDATE users SET is_active = 0 WHERE username = ?", (target.strip().lower(),))
+                st.success(f"Deactivated '{target}'") if c.rowcount else st.error("User not found.")
+                st.rerun()
+        with col_b:
+            if st.button("Reactivate", type="primary"):
+                with get_db() as conn:
+                    c = conn.execute("UPDATE users SET is_active = 1 WHERE username = ?", (target.strip().lower(),))
+                st.success(f"Reactivated '{target}'") if c.rowcount else st.error("User not found.")
+                st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────
 # ROUTER  — no CSS, no imports, just route and render
 # ─────────────────────────────────────────────────────────────
 invite_token = st.query_params.get("invite", None)
+is_admin     = st.query_params.get("admin", None) == "1"
 
-if invite_token:
+if is_admin:
+    render_admin()
+elif invite_token:
     render_signup(invite_token)
 elif is_logged_in(st.session_state):
     render_app()

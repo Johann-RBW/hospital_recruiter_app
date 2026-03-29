@@ -11,6 +11,12 @@ textColor="#1A1916"
 primaryColor="#D4380D"
 font="sans serif"
 
+[browser]
+gatherUsageStats = false
+
 [client]
-# Hides the Streamlit toolbar in the top right
+showSidebarNavigation = false
 toolbarMode = "minimal"
+
+[deploy]
+showDeployButton = false
